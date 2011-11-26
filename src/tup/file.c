@@ -26,17 +26,15 @@
 #include "config.h"
 #include "entry.h"
 #include "option.h"
+#include "container.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <fcntl.h>
 #include <sys/stat.h>
 
-static struct file_entry *new_entry(const char *filename);
+static struct file_entry *new_entry(const char *filename, int len);
 static void del_entry(struct file_entry *fent);
-static void check_unlink_list(const struct pel_group *pg,
-			      struct file_entry_head *u_head);
-static void handle_unlink(struct file_info *info);
 static int update_write_info(FILE *f, tupid_t cmdid, struct file_info *info,
 			     int *warnings, struct tup_entry_head *entryhead);
 static int update_read_info(FILE *f, tupid_t cmdid, struct file_info *info,
@@ -49,10 +47,9 @@ static int add_parser_files_locked(FILE *f, struct file_info *finfo,
 
 int init_file_info(struct file_info *info, const char *variant_dir)
 {
-	LIST_INIT(&info->read_list);
-	LIST_INIT(&info->write_list);
-	LIST_INIT(&info->unlink_list);
-	LIST_INIT(&info->var_list);
+	RB_INIT(&info->read_root);
+	RB_INIT(&info->write_root);
+	RB_INIT(&info->var_root);
 	LIST_INIT(&info->mapping_list);
 	LIST_INIT(&info->tmpdir_list);
 	pthread_mutex_init(&info->lock, NULL);
@@ -95,30 +92,113 @@ int handle_file(enum access_type at, const char *filename, const char *file2,
 	return rc;
 }
 
+static int handle_read(const char *filename, struct file_info *info)
+{
+	struct file_entry *fent;
+	int len = strlen(filename);
+
+	if(string_tree_search(&info->read_root, filename, len) ||
+	   string_tree_search(&info->write_root, filename, len)) {
+		/* If we already have it in the read or write trees, we're good */
+		return 0;
+	}
+	fent = new_entry(filename, len);
+	if(!fent)
+		return -1;
+	if(string_tree_insert(&info->read_root, &fent->filename) < 0) {
+		fprintf(stderr, "tup internal error: Unable to insert filename into read_root\n");
+		return -1;
+	}
+	return 0;
+}
+
+static int handle_write(const char *filename, struct file_info *info)
+{
+	struct string_tree *st;
+	int len = strlen(filename);
+
+	if(string_tree_search(&info->write_root, filename, len)) {
+		/* If we already have it in the write tree, we're good */
+		return 0;
+	}
+	st = string_tree_search(&info->read_root, filename, len);
+	if(st) {
+		/* If we have it in the read tree, we move it to the write tree */
+		string_tree_rm(&info->read_root, st);
+	} else {
+		/* Otherwise we make a new entry. */
+		struct file_entry *fent;
+
+		fent = new_entry(filename, len);
+		if(!fent)
+			return -1;
+		st = &fent->filename;
+	}
+	if(string_tree_insert(&info->write_root, st) < 0) {
+		fprintf(stderr, "tup internal error: Unable to insert filename into write_root\n");
+		return -1;
+	}
+	return 0;
+}
+
+static int handle_unlink(const char *filename, struct file_info *info)
+{
+	struct file_entry *fent;
+	struct string_tree *st;
+	int len = strlen(filename);
+
+	st = string_tree_search(&info->read_root, filename, len);
+	if(st) {
+		fent = container_of(st, struct file_entry, filename);
+		string_tree_rm(&info->read_root, st);
+		del_entry(fent);
+	}
+
+	st = string_tree_search(&info->write_root, filename, len);
+	if(st) {
+		fent = container_of(st, struct file_entry, filename);
+		string_tree_rm(&info->write_root, st);
+		del_entry(fent);
+	}
+	return 0;
+}
+
+static int handle_var(const char *filename, struct file_info *info)
+{
+	struct file_entry *fent;
+	int len = strlen(filename);
+
+	if(string_tree_search(&info->var_root, filename, len)) {
+		/* If we already accessed the var, we're good. */
+		return 0;
+	}
+	fent = new_entry(filename, len);
+	if(!fent)
+		return -1;
+	if(string_tree_insert(&info->var_root, &fent->filename) < 0) {
+		fprintf(stderr, "tup internal error: Unable to insert variable entry into var_root\n");
+		return -1;
+	}
+	return 0;
+}
+
 int handle_open_file(enum access_type at, const char *filename,
 		     struct file_info *info)
 {
-	struct file_entry *fent;
 	int rc = 0;
-
-	fent = new_entry(filename);
-	if(!fent) {
-		return -1;
-	}
 
 	switch(at) {
 		case ACCESS_READ:
-			LIST_INSERT_HEAD(&info->read_list, fent, list);
+			rc = handle_read(filename, info);
 			break;
 		case ACCESS_WRITE:
-			check_unlink_list(&fent->pg, &info->unlink_list);
-			LIST_INSERT_HEAD(&info->write_list, fent, list);
+			rc = handle_write(filename, info);
 			break;
 		case ACCESS_UNLINK:
-			LIST_INSERT_HEAD(&info->unlink_list, fent, list);
+			rc = handle_unlink(filename, info);
 			break;
 		case ACCESS_VAR:
-			LIST_INSERT_HEAD(&info->var_list, fent, list);
+			rc = handle_var(filename, info);
 			break;
 		case ACCESS_RENAME:
 		default:
@@ -140,7 +220,6 @@ int write_files(FILE *f, tupid_t cmdid, struct file_info *info, int *warnings,
 	int rc1 = 0, rc2;
 
 	finfo_lock(info);
-	handle_unlink(info);
 
 	if(!check_only) {
 		LIST_FOREACH(tmpdir, &info->tmpdir_list, list) {
@@ -270,16 +349,17 @@ static int file_set_mtime(struct tup_entry *tent, const char *file)
 
 static int add_config_files_locked(struct file_info *finfo, struct tup_entry *tent)
 {
+	struct string_tree *st;
 	struct file_entry *r;
 	struct tup_entry_head *entrylist;
 	int full_deps = tup_option_get_int("updater.full_deps");
 
 	entrylist = tup_entry_get_list();
-	while(!LIST_EMPTY(&finfo->read_list)) {
+	while((st = RB_ROOT(&finfo->read_root)) != NULL) {
 		struct tup_entry *tmp;
-		r = LIST_FIRST(&finfo->read_list);
+		r = container_of(st, struct file_entry, filename);
 
-		if(add_node_to_list(stderr, DOT_DT, &r->pg, entrylist, full_deps, r->filename) < 0)
+		if(add_node_to_list(stderr, DOT_DT, &r->pg, entrylist, full_deps, r->filename.s) < 0)
 			return -1;
 
 		/* Don't link to ourself */
@@ -288,6 +368,7 @@ static int add_config_files_locked(struct file_info *finfo, struct tup_entry *te
 			tup_entry_list_del(tmp);
 		}
 
+		string_tree_rm(&finfo->read_root, st);
 		del_entry(r);
 	}
 	if(tup_db_check_config_inputs(tent, entrylist) < 0)
@@ -300,6 +381,7 @@ static int add_config_files_locked(struct file_info *finfo, struct tup_entry *te
 static int add_parser_files_locked(FILE *f, struct file_info *finfo,
 				   struct tupid_entries *root, tupid_t vardt)
 {
+	struct string_tree *st;
 	struct file_entry *r;
 	struct mapping *map;
 	struct tup_entry_head *entrylist;
@@ -308,17 +390,18 @@ static int add_parser_files_locked(FILE *f, struct file_info *finfo,
 	int full_deps = tup_option_get_int("updater.full_deps");
 
 	entrylist = tup_entry_get_list();
-	while(!LIST_EMPTY(&finfo->read_list)) {
-		r = LIST_FIRST(&finfo->read_list);
-		if(add_node_to_list(f, DOT_DT, &r->pg, entrylist, full_deps, r->filename) < 0)
+	while((st = RB_ROOT(&finfo->read_root)) != NULL) {
+		r = container_of(st, struct file_entry, filename);
+		if(add_node_to_list(f, DOT_DT, &r->pg, entrylist, full_deps, r->filename.s) < 0)
 			return -1;
+		string_tree_rm(&finfo->read_root, st);
 		del_entry(r);
 	}
-	while(!LIST_EMPTY(&finfo->var_list)) {
-		r = LIST_FIRST(&finfo->var_list);
-
+	while((st = RB_ROOT(&finfo->var_root)) != NULL) {
+		r = container_of(st, struct file_entry, filename);
 		if(add_node_to_list(f, vardt, &r->pg, entrylist, 0, NULL) < 0)
 			return -1;
+		string_tree_rm(&finfo->var_root, st);
 		del_entry(r);
 	}
 	LIST_FOREACH(tent, entrylist, list) {
@@ -327,12 +410,6 @@ static int add_parser_files_locked(FILE *f, struct file_info *finfo,
 				return -1;
 	}
 	tup_entry_release_list();
-
-	/* TODO: write_list not needed here? */
-	while(!LIST_EMPTY(&finfo->write_list)) {
-		r = LIST_FIRST(&finfo->write_list);
-		del_entry(r);
-	}
 
 	while(!LIST_EMPTY(&finfo->mapping_list)) {
 		map = LIST_FIRST(&finfo->mapping_list);
@@ -357,7 +434,7 @@ static int add_parser_files_locked(FILE *f, struct file_info *finfo,
 	return 0;
 }
 
-static struct file_entry *new_entry(const char *filename)
+static struct file_entry *new_entry(const char *filename, int len)
 {
 	struct file_entry *fent;
 
@@ -367,15 +444,18 @@ static struct file_entry *new_entry(const char *filename)
 		return NULL;
 	}
 
-	fent->filename = strdup(filename);
-	if(!fent->filename) {
+	fent->filename.s = malloc(len+1);
+	if(!fent->filename.s) {
 		perror("strdup");
 		free(fent);
 		return NULL;
 	}
+	memcpy(fent->filename.s, filename, len);
+	fent->filename.s[len] = 0;
+	fent->filename.len = len;
 
-	if(get_path_elements(fent->filename, &fent->pg) < 0) {
-		free(fent->filename);
+	if(get_path_elements(fent->filename.s, &fent->pg) < 0) {
+		free(fent->filename.s);
 		free(fent);
 		return NULL;
 	}
@@ -384,55 +464,49 @@ static struct file_entry *new_entry(const char *filename)
 
 static void del_entry(struct file_entry *fent)
 {
-	LIST_REMOVE(fent, list);
 	del_pel_group(&fent->pg);
-	free(fent->filename);
+	free(fent->filename.s);
 	free(fent);
 }
 
 int handle_rename(const char *from, const char *to, struct file_info *info)
 {
 	struct file_entry *fent;
-	struct pel_group pg_from;
-	struct pel_group pg_to;
+	struct string_tree *st;
+	int tolen = strlen(to);
 
-	if(get_path_elements(from, &pg_from) < 0)
-		return -1;
-	if(get_path_elements(to, &pg_to) < 0)
-		return -1;
+	st = string_tree_search(&info->write_root, from, strlen(from));
+	if(st) {
+		fent = container_of(st, struct file_entry, filename);
+		string_tree_rm(&info->write_root, st);
 
-	LIST_FOREACH(fent, &info->write_list, list) {
-		if(pg_eq(&fent->pg, &pg_from)) {
-			del_pel_group(&fent->pg);
-			free(fent->filename);
-
-			fent->filename = strdup(to);
-			if(!fent->filename) {
-				perror("strdup");
-				return -1;
-			}
-			if(get_path_elements(fent->filename, &fent->pg) < 0)
-				return -1;
+		if(string_tree_search(&info->write_root, to, tolen)) {
+			/* If we already tried to write to 'to', then renaming
+			 * over it just means we stop tracking 'from'.
+			 */
+			del_entry(fent);
+			return 0;
 		}
-	}
-	LIST_FOREACH(fent, &info->read_list, list) {
-		if(pg_eq(&fent->pg, &pg_from)) {
-			del_pel_group(&fent->pg);
-			free(fent->filename);
 
-			fent->filename = strdup(to);
-			if(!fent->filename) {
-				perror("strdup");
-				return -1;
-			}
-			if(get_path_elements(fent->filename, &fent->pg) < 0)
-				return -1;
+		del_pel_group(&fent->pg);
+		free(fent->filename.s);
+		fent->filename.s = strdup(to);
+		if(!fent->filename.s) {
+			perror("strdup");
+			return -1;
 		}
+		fent->filename.len = tolen;
+		if(get_path_elements(fent->filename.s, &fent->pg) < 0)
+			return -1;
+		if(string_tree_insert(&info->write_root, &fent->filename) < 0) {
+			fprintf(stderr, "tup internal error: Unable to insert renamed file into write_root\n");
+			return -1;
+		}
+	} else {
+		fprintf(stderr, "tup internal error: handle_rename() called on file '%s' which was never written to.\n", from);
+		return -1;
 	}
 
-	check_unlink_list(&pg_to, &info->unlink_list);
-	del_pel_group(&pg_to);
-	del_pel_group(&pg_from);
 	return 0;
 }
 
@@ -444,65 +518,23 @@ void del_map(struct mapping *map)
 	free(map);
 }
 
-static void check_unlink_list(const struct pel_group *pg,
-			      struct file_entry_head *u_head)
-{
-	struct file_entry *fent, *tmp;
-
-	LIST_FOREACH_SAFE(fent, u_head, list, tmp) {
-		if(pg_eq(&fent->pg, pg)) {
-			del_entry(fent);
-		}
-	}
-}
-
-static void handle_unlink(struct file_info *info)
-{
-	struct file_entry *u, *fent, *tmp;
-
-	while(!LIST_EMPTY(&info->unlink_list)) {
-		u = LIST_FIRST(&info->unlink_list);
-
-		LIST_FOREACH_SAFE(fent, &info->write_list, list, tmp) {
-			if(pg_eq(&fent->pg, &u->pg)) {
-				del_entry(fent);
-			}
-		}
-		LIST_FOREACH_SAFE(fent, &info->read_list, list, tmp) {
-			if(pg_eq(&fent->pg, &u->pg)) {
-				del_entry(fent);
-			}
-		}
-
-		del_entry(u);
-	}
-}
-
 static int update_write_info(FILE *f, tupid_t cmdid, struct file_info *info,
 			     int *warnings, struct tup_entry_head *entryhead)
 {
 	struct file_entry *w;
-	struct file_entry *r;
-	struct file_entry *tmp;
 	struct tup_entry *tent;
 	int write_bork = 0;
+	struct string_tree *st;
 
-	while(!LIST_EMPTY(&info->write_list)) {
+	while((st = RB_ROOT(&info->write_root)) != NULL) {
 		tupid_t newdt;
 		struct path_element *pel = NULL;
 
-		w = LIST_FIRST(&info->write_list);
-
-		/* Remove duplicate write entries */
-		LIST_FOREACH_SAFE(r, &info->write_list, list, tmp) {
-			if(r != w && pg_eq(&w->pg, &r->pg)) {
-				del_entry(r);
-			}
-		}
+		w = container_of(st, struct file_entry, filename);
 
 		if(w->pg.pg_flags & PG_HIDDEN) {
 			if(warnings) {
-				fprintf(f, "tup warning: Writing to hidden file '%s'\n", w->filename);
+				fprintf(f, "tup warning: Writing to hidden file '%s'\n", w->filename.s);
 				(*warnings)++;
 			}
 			goto out_skip;
@@ -510,7 +542,7 @@ static int update_write_info(FILE *f, tupid_t cmdid, struct file_info *info,
 
 		newdt = find_dir_tupid_dt_pg(f, DOT_DT, &w->pg, &pel, 0, 0);
 		if(newdt <= 0) {
-			fprintf(f, "tup error: File '%s' was written to, but is not in .tup/db. You probably should specify it as an output\n", w->filename);
+			fprintf(f, "tup error: File '%s' was written to, but is not in .tup/db. You probably should specify it as an output\n", w->filename.s);
 			return -1;
 		}
 		if(!pel) {
@@ -522,20 +554,21 @@ static int update_write_info(FILE *f, tupid_t cmdid, struct file_info *info,
 			return -1;
 		free(pel);
 		if(!tent) {
-			fprintf(f, "tup error: File '%s' was written to, but is not in .tup/db. You probably should specify it as an output\n", w->filename);
+			fprintf(f, "tup error: File '%s' was written to, but is not in .tup/db. You probably should specify it as an output\n", w->filename.s);
 			write_bork = 1;
 		} else {
 			struct mapping *map;
 			tup_entry_list_add(tent, entryhead);
 
 			LIST_FOREACH(map, &info->mapping_list, list) {
-				if(strcmp(map->realname, w->filename) == 0) {
+				if(strcmp(map->realname, w->filename.s) == 0) {
 					map->tent = tent;
 				}
 			}
 		}
 
 out_skip:
+		string_tree_rm(&info->write_root, st);
 		del_entry(w);
 	}
 
@@ -586,20 +619,21 @@ static int update_read_info(FILE *f, tupid_t cmdid, struct file_info *info,
 			    struct tupid_entries *normal_root, int full_deps, tupid_t vardt)
 {
 	struct file_entry *r;
+	struct string_tree *st;
 
-	while(!LIST_EMPTY(&info->read_list)) {
-		r = LIST_FIRST(&info->read_list);
-
-		if(add_node_to_list(f, DOT_DT, &r->pg, entryhead, full_deps, r->filename) < 0)
+	while((st = RB_ROOT(&info->read_root)) != NULL) {
+		r = container_of(st, struct file_entry, filename);
+		if(add_node_to_list(f, DOT_DT, &r->pg, entryhead, full_deps, r->filename.s) < 0)
 			return -1;
+		string_tree_rm(&info->read_root, st);
 		del_entry(r);
 	}
 
-	while(!LIST_EMPTY(&info->var_list)) {
-		r = LIST_FIRST(&info->var_list);
-
+	while((st = RB_ROOT(&info->var_root)) != NULL) {
+		r = container_of(st, struct file_entry, filename);
 		if(add_node_to_list(f, vardt, &r->pg, entryhead, 0, NULL) < 0)
 			return -1;
+		string_tree_rm(&info->var_root, st);
 		del_entry(r);
 	}
 

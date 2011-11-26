@@ -138,7 +138,6 @@ run script share site/wiki?
 gimme_node_or_make_ghost - if(new_dt == 0) block never used?
 
 write_list not needed? Just use mapping list?
- - use string_trees instead of read/write/mapping list once all files are full path/canonicalized
 
 check using mmap instead of open/read for reading in files via fslurp? Use madvise to say it's a sequential read?
 

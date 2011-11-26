@@ -24,6 +24,7 @@
 #include "tupid.h"
 #include "access_event.h"
 #include "bsd/queue.h"
+#include "string_tree.h"
 #include "thread_tree.h"
 #include "pel_group.h"
 #include <stdio.h>
@@ -47,8 +48,7 @@ struct tmpdir {
 LIST_HEAD(tmpdir_head, tmpdir);
 
 struct file_entry {
-	LIST_ENTRY(file_entry) list;
-	char *filename;
+	struct string_tree filename;
 	struct pel_group pg;
 };
 LIST_HEAD(file_entry_head, file_entry);
@@ -56,10 +56,9 @@ LIST_HEAD(file_entry_head, file_entry);
 struct file_info {
 	pthread_mutex_t lock;
 	struct thread_tree tnode;
-	struct file_entry_head read_list;
-	struct file_entry_head write_list;
-	struct file_entry_head unlink_list;
-	struct file_entry_head var_list;
+	struct string_entries read_root;
+	struct string_entries write_root;
+	struct string_entries var_root;
 	struct mapping_head mapping_list;
 	struct tmpdir_head tmpdir_list;
 	const char *variant_dir;
