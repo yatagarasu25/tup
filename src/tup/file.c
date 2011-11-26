@@ -34,7 +34,7 @@
 #include <sys/stat.h>
 
 static struct file_entry *new_entry(const char *filename, int len);
-static void del_entry(struct file_entry *fent);
+static void del_entry(struct file_entry *fent, struct string_entries *root);
 static int update_write_info(FILE *f, tupid_t cmdid, struct file_info *info,
 			     int *warnings, struct tup_entry_head *entryhead);
 static int update_read_info(FILE *f, tupid_t cmdid, struct file_info *info,
@@ -48,9 +48,8 @@ static int add_parser_files_locked(FILE *f, struct file_info *finfo,
 int init_file_info(struct file_info *info, const char *variant_dir)
 {
 	RB_INIT(&info->read_root);
-	RB_INIT(&info->write_root);
 	RB_INIT(&info->var_root);
-	LIST_INIT(&info->mapping_list);
+	RB_INIT(&info->mapping_root);
 	LIST_INIT(&info->tmpdir_list);
 	pthread_mutex_init(&info->lock, NULL);
 	/* Root variant gets a NULL variant_dir so we can skip trying to do the
@@ -75,18 +74,13 @@ void finfo_unlock(struct file_info *info)
 	pthread_mutex_unlock(&info->lock);
 }
 
-int handle_file(enum access_type at, const char *filename, const char *file2,
-		struct file_info *info)
+int handle_file(enum access_type at, const char *filename, struct file_info *info)
 {
 	DEBUGP("received file '%s' in mode %i\n", filename, at);
 	int rc;
 
 	finfo_lock(info);
-	if(at == ACCESS_RENAME) {
-		rc = handle_rename(filename, file2, info);
-	} else {
-		rc = handle_open_file(at, filename, info);
-	}
+	rc = handle_open_file(at, filename, info);
 	finfo_unlock(info);
 
 	return rc;
@@ -98,7 +92,7 @@ static int handle_read(const char *filename, struct file_info *info)
 	int len = strlen(filename);
 
 	if(string_tree_search(&info->read_root, filename, len) ||
-	   string_tree_search(&info->write_root, filename, len)) {
+	   string_tree_search(&info->mapping_root, filename, len)) {
 		/* If we already have it in the read or write trees, we're good */
 		return 0;
 	}
@@ -108,57 +102,6 @@ static int handle_read(const char *filename, struct file_info *info)
 	if(string_tree_insert(&info->read_root, &fent->filename) < 0) {
 		fprintf(stderr, "tup internal error: Unable to insert filename into read_root\n");
 		return -1;
-	}
-	return 0;
-}
-
-static int handle_write(const char *filename, struct file_info *info)
-{
-	struct string_tree *st;
-	int len = strlen(filename);
-
-	if(string_tree_search(&info->write_root, filename, len)) {
-		/* If we already have it in the write tree, we're good */
-		return 0;
-	}
-	st = string_tree_search(&info->read_root, filename, len);
-	if(st) {
-		/* If we have it in the read tree, we move it to the write tree */
-		string_tree_rm(&info->read_root, st);
-	} else {
-		/* Otherwise we make a new entry. */
-		struct file_entry *fent;
-
-		fent = new_entry(filename, len);
-		if(!fent)
-			return -1;
-		st = &fent->filename;
-	}
-	if(string_tree_insert(&info->write_root, st) < 0) {
-		fprintf(stderr, "tup internal error: Unable to insert filename into write_root\n");
-		return -1;
-	}
-	return 0;
-}
-
-static int handle_unlink(const char *filename, struct file_info *info)
-{
-	struct file_entry *fent;
-	struct string_tree *st;
-	int len = strlen(filename);
-
-	st = string_tree_search(&info->read_root, filename, len);
-	if(st) {
-		fent = container_of(st, struct file_entry, filename);
-		string_tree_rm(&info->read_root, st);
-		del_entry(fent);
-	}
-
-	st = string_tree_search(&info->write_root, filename, len);
-	if(st) {
-		fent = container_of(st, struct file_entry, filename);
-		string_tree_rm(&info->write_root, st);
-		del_entry(fent);
 	}
 	return 0;
 }
@@ -191,15 +134,11 @@ int handle_open_file(enum access_type at, const char *filename,
 		case ACCESS_READ:
 			rc = handle_read(filename, info);
 			break;
-		case ACCESS_WRITE:
-			rc = handle_write(filename, info);
-			break;
-		case ACCESS_UNLINK:
-			rc = handle_unlink(filename, info);
-			break;
 		case ACCESS_VAR:
 			rc = handle_var(filename, info);
 			break;
+		case ACCESS_WRITE:
+		case ACCESS_UNLINK:
 		case ACCESS_RENAME:
 		default:
 			fprintf(stderr, "Invalid event type: %i\n", at);
@@ -208,6 +147,17 @@ int handle_open_file(enum access_type at, const char *filename,
 	}
 
 	return rc;
+}
+
+void ignore_read_file(const char *filename, int len, struct file_info *info)
+{
+	struct string_tree *st;
+	st = string_tree_search(&info->read_root, filename, len);
+	if(st) {
+		struct file_entry *fent;
+		fent = container_of(st, struct file_entry, filename);
+		del_entry(fent, &info->read_root);
+	}
 }
 
 int write_files(FILE *f, tupid_t cmdid, struct file_info *info, int *warnings,
@@ -369,7 +319,7 @@ static int add_config_files_locked(struct file_info *finfo, struct tup_entry *te
 		}
 
 		string_tree_rm(&finfo->read_root, st);
-		del_entry(r);
+		del_entry(r, &finfo->read_root);
 	}
 	if(tup_db_check_config_inputs(tent, entrylist) < 0)
 		return -1;
@@ -394,15 +344,13 @@ static int add_parser_files_locked(FILE *f, struct file_info *finfo,
 		r = container_of(st, struct file_entry, filename);
 		if(add_node_to_list(f, DOT_DT, &r->pg, entrylist, full_deps, r->filename.s) < 0)
 			return -1;
-		string_tree_rm(&finfo->read_root, st);
-		del_entry(r);
+		del_entry(r, &finfo->read_root);
 	}
 	while((st = RB_ROOT(&finfo->var_root)) != NULL) {
 		r = container_of(st, struct file_entry, filename);
 		if(add_node_to_list(f, vardt, &r->pg, entrylist, 0, NULL) < 0)
 			return -1;
-		string_tree_rm(&finfo->var_root, st);
-		del_entry(r);
+		del_entry(r, &finfo->var_root);
 	}
 	LIST_FOREACH(tent, entrylist, list) {
 		if(strcmp(tent->name.s, ".gitignore") != 0)
@@ -411,23 +359,23 @@ static int add_parser_files_locked(FILE *f, struct file_info *finfo,
 	}
 	tup_entry_release_list();
 
-	while(!LIST_EMPTY(&finfo->mapping_list)) {
-		map = LIST_FIRST(&finfo->mapping_list);
+	while((st = RB_ROOT(&finfo->mapping_root)) != NULL) {
+		map = container_of(st, struct mapping, realname);
 
-		if(gimme_tent(map->realname, &tent) < 0)
+		if(gimme_tent(map->realname.s, &tent) < 0)
 			return -1;
 		if(!tent || strcmp(tent->name.s, ".gitignore") != 0) {
-			fprintf(stderr, "tup error: Writing to file '%s' while parsing is not allowed. Only a .gitignore file may be created during the parsing stage.\n", map->realname);
+			fprintf(stderr, "tup error: Writing to file '%s' while parsing is not allowed. Only a .gitignore file may be created during the parsing stage.\n", map->realname.s);
 			map_bork = 1;
 		} else {
-			if(renameat(tup_top_fd(), map->tmpname, tup_top_fd(), map->realname) < 0) {
+			if(renameat(tup_top_fd(), map->tmpname, tup_top_fd(), map->realname.s) < 0) {
 				perror("renameat");
 				return -1;
 			}
-			if(file_set_mtime(tent, map->realname) < 0)
+			if(file_set_mtime(tent, map->realname.s) < 0)
 				return -1;
 		}
-		del_map(map);
+		del_map(map, &finfo->mapping_root);
 	}
 	if(map_bork)
 		return -1;
@@ -462,87 +410,51 @@ static struct file_entry *new_entry(const char *filename, int len)
 	return fent;
 }
 
-static void del_entry(struct file_entry *fent)
+static void del_entry(struct file_entry *fent, struct string_entries *root)
 {
+	string_tree_rm(root, &fent->filename);
 	del_pel_group(&fent->pg);
 	free(fent->filename.s);
 	free(fent);
 }
 
-int handle_rename(const char *from, const char *to, struct file_info *info)
+void del_map(struct mapping *map, struct string_entries *mapping_root)
 {
-	struct file_entry *fent;
-	struct string_tree *st;
-	int tolen = strlen(to);
-
-	st = string_tree_search(&info->write_root, from, strlen(from));
-	if(st) {
-		fent = container_of(st, struct file_entry, filename);
-		string_tree_rm(&info->write_root, st);
-
-		if(string_tree_search(&info->write_root, to, tolen)) {
-			/* If we already tried to write to 'to', then renaming
-			 * over it just means we stop tracking 'from'.
-			 */
-			del_entry(fent);
-			return 0;
-		}
-
-		del_pel_group(&fent->pg);
-		free(fent->filename.s);
-		fent->filename.s = strdup(to);
-		if(!fent->filename.s) {
-			perror("strdup");
-			return -1;
-		}
-		fent->filename.len = tolen;
-		if(get_path_elements(fent->filename.s, &fent->pg) < 0)
-			return -1;
-		if(string_tree_insert(&info->write_root, &fent->filename) < 0) {
-			fprintf(stderr, "tup internal error: Unable to insert renamed file into write_root\n");
-			return -1;
-		}
-	} else {
-		fprintf(stderr, "tup internal error: handle_rename() called on file '%s' which was never written to.\n", from);
-		return -1;
-	}
-
-	return 0;
-}
-
-void del_map(struct mapping *map)
-{
-	LIST_REMOVE(map, list);
+	string_tree_rm(mapping_root, &map->realname);
 	free(map->tmpname);
-	free(map->realname);
+	free(map->realname.s);
 	free(map);
 }
 
 static int update_write_info(FILE *f, tupid_t cmdid, struct file_info *info,
 			     int *warnings, struct tup_entry_head *entryhead)
 {
-	struct file_entry *w;
-	struct tup_entry *tent;
 	int write_bork = 0;
 	struct string_tree *st;
+	struct mapping *map;
 
-	while((st = RB_ROOT(&info->write_root)) != NULL) {
+	RB_FOREACH(st, string_entries, &info->mapping_root) {
 		tupid_t newdt;
 		struct path_element *pel = NULL;
+		struct pel_group pg;
 
-		w = container_of(st, struct file_entry, filename);
+		map = container_of(st, struct mapping, realname);
 
-		if(w->pg.pg_flags & PG_HIDDEN) {
-			if(warnings) {
-				fprintf(f, "tup warning: Writing to hidden file '%s'\n", w->filename.s);
-				(*warnings)++;
-			}
-			goto out_skip;
+		if(get_path_elements(map->realname.s, &pg) < 0) {
+			return -1;
 		}
 
-		newdt = find_dir_tupid_dt_pg(f, DOT_DT, &w->pg, &pel, 0, 0);
+		if(pg.pg_flags & PG_HIDDEN) {
+			if(warnings) {
+				fprintf(f, "tup warning: Writing to hidden file '%s'\n", map->realname.s);
+				(*warnings)++;
+			}
+			continue;
+		}
+
+		newdt = find_dir_tupid_dt_pg(f, DOT_DT, &pg, &pel, 0, 0);
 		if(newdt <= 0) {
-			fprintf(f, "tup error: File '%s' was written to, but is not in .tup/db. You probably should specify it as an output\n", w->filename.s);
+			fprintf(f, "tup error: File '%s' was written to, but is not in .tup/db. You probably should specify it as an output\n", map->realname.s);
 			return -1;
 		}
 		if(!pel) {
@@ -550,35 +462,22 @@ static int update_write_info(FILE *f, tupid_t cmdid, struct file_info *info,
 			return -1;
 		}
 
-		if(tup_db_select_tent_part(newdt, pel->path, pel->len, &tent) < 0)
+		if(tup_db_select_tent_part(newdt, pel->path, pel->len, &map->tent) < 0)
 			return -1;
 		free(pel);
-		if(!tent) {
-			fprintf(f, "tup error: File '%s' was written to, but is not in .tup/db. You probably should specify it as an output\n", w->filename.s);
+		if(!map->tent) {
+			fprintf(f, "tup error: File '%s' was written to, but is not in .tup/db. You probably should specify it as an output\n", map->realname.s);
 			write_bork = 1;
 		} else {
-			struct mapping *map;
-			tup_entry_list_add(tent, entryhead);
-
-			LIST_FOREACH(map, &info->mapping_list, list) {
-				if(strcmp(map->realname, w->filename.s) == 0) {
-					map->tent = tent;
-				}
-			}
+			tup_entry_list_add(map->tent, entryhead);
 		}
-
-out_skip:
-		string_tree_rm(&info->write_root, st);
-		del_entry(w);
 	}
 
 	if(write_bork) {
-		while(!LIST_EMPTY(&info->mapping_list)) {
-			struct mapping *map;
-
-			map = LIST_FIRST(&info->mapping_list);
+		while((st = RB_ROOT(&info->mapping_root)) != NULL) {
+			map = container_of(st, struct mapping, realname);
 			unlink(map->tmpname);
-			del_map(map);
+			del_map(map, &info->mapping_root);
 		}
 		return -1;
 	}
@@ -586,25 +485,23 @@ out_skip:
 	if(tup_db_check_actual_outputs(f, cmdid, entryhead) < 0)
 		return -1;
 
-	while(!LIST_EMPTY(&info->mapping_list)) {
-		struct mapping *map;
-
-		map = LIST_FIRST(&info->mapping_list);
+	while((st = RB_ROOT(&info->mapping_root)) != NULL) {
+		map = container_of(st, struct mapping, realname);
 
 		/* TODO: strcmp only here for win32 support */
-		if(strcmp(map->tmpname, map->realname) != 0) {
-			if(renameat(tup_top_fd(), map->tmpname, tup_top_fd(), map->realname) < 0) {
-				perror(map->realname);
-				fprintf(f, "tup error: Unable to rename temporary file '%s' to destination '%s'\n", map->tmpname, map->realname);
+		if(strcmp(map->tmpname, map->realname.s) != 0) {
+			if(renameat(tup_top_fd(), map->tmpname, tup_top_fd(), map->realname.s) < 0) {
+				perror(map->realname.s);
+				fprintf(f, "tup error: Unable to rename temporary file '%s' to destination '%s'\n", map->tmpname, map->realname.s);
 				write_bork = 1;
 			}
 		}
 		if(map->tent) {
 			/* tent may not be set (in the case of hidden files) */
-			if(file_set_mtime(map->tent, map->realname) < 0)
+			if(file_set_mtime(map->tent, map->realname.s) < 0)
 				return -1;
 		}
-		del_map(map);
+		del_map(map, &info->mapping_root);
 	}
 
 	if(write_bork)
@@ -625,16 +522,14 @@ static int update_read_info(FILE *f, tupid_t cmdid, struct file_info *info,
 		r = container_of(st, struct file_entry, filename);
 		if(add_node_to_list(f, DOT_DT, &r->pg, entryhead, full_deps, r->filename.s) < 0)
 			return -1;
-		string_tree_rm(&info->read_root, st);
-		del_entry(r);
+		del_entry(r, &info->read_root);
 	}
 
 	while((st = RB_ROOT(&info->var_root)) != NULL) {
 		r = container_of(st, struct file_entry, filename);
 		if(add_node_to_list(f, vardt, &r->pg, entryhead, 0, NULL) < 0)
 			return -1;
-		string_tree_rm(&info->var_root, st);
-		del_entry(r);
+		del_entry(r, &info->var_root);
 	}
 
 	if(tup_db_check_actual_inputs(f, cmdid, entryhead, sticky_root, normal_root) < 0)

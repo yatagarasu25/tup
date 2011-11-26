@@ -161,27 +161,23 @@ static struct mapping *add_mapping(const char *path)
 
 		peeled = peel(path);
 
-		if(handle_open_file(ACCESS_WRITE, peeled, finfo) < 0) {
-			/* TODO: Set failure on internal server? */
-			fprintf(stderr, "tup internal error: handle open file failed\n");
-			return NULL;
-		}
-
 		map = malloc(sizeof *map);
 		if(!map) {
 			perror("malloc");
-			return NULL;
+			goto out_err;
 		}
-		map->realname = strdup(peeled);
-		if(!map->realname) {
+		map->realname.s = strdup(peeled);
+		if(!map->realname.s) {
 			perror("strdup");
-			return NULL;
+			goto out_err;
 		}
+		map->realname.len = strlen(map->realname.s);
+
 		size = sizeof(int) * 2 + sizeof(TUP_TMP) + 1;
 		map->tmpname = malloc(size);
 		if(!map->tmpname) {
 			perror("malloc");
-			return NULL;
+			goto out_err;
 		}
 		map->tent = NULL; /* This is used when saving dependencies */
 
@@ -192,25 +188,33 @@ static struct mapping *add_mapping(const char *path)
 
 		if(snprintf(map->tmpname, size, TUP_TMP "/%x", myfile) >= size) {
 			fprintf(stderr, "tup internal error: mapping tmpname is sized incorrectly.\n");
-			return NULL;
+			goto out_err;
 		}
 
-		LIST_INSERT_HEAD(&finfo->mapping_list, map, list);
+		if(string_tree_insert(&finfo->mapping_root, &map->realname) < 0) {
+			fprintf(stderr, "tup internal error: Unable to add map entry for '%s'\n", path);
+			goto out_err;
+		}
+
+		ignore_read_file(map->realname.s, map->realname.len, finfo);
 		put_finfo(finfo);
 	}
 	return map;
+
+out_err:
+	put_finfo(finfo);
+	return NULL;
 }
 
 static struct mapping *find_mapping(struct file_info *finfo, const char *path)
 {
 	const char *peeled;
-	struct mapping *map;
+	struct string_tree *st;
 
 	peeled = peel(path);
-	LIST_FOREACH(map, &finfo->mapping_list, list) {
-		if(strcmp(peeled, map->realname) == 0) {
-			return map;
-		}
+	st = string_tree_search(&finfo->mapping_root, peeled, strlen(peeled));
+	if(st) {
+		return container_of(st, struct mapping, realname);
 	}
 	return NULL;
 }
@@ -261,15 +265,21 @@ static int ignore_file(const char *path)
 static void tup_fuse_handle_file(const char *path, const char *stripped, enum access_type at)
 {
 	struct file_info *finfo;
+	const char *peeled;
 
 	if(ignore_file(peel(path)))
 		return;
 
 	finfo = get_finfo(path);
 	if(finfo) {
-		if(handle_open_file(at, peel(path), finfo) < 0) {
-			/* TODO: Set failure on internal server? */
-			fprintf(stderr, "tup internal error: handle open file failed\n");
+		peeled = peel(path);
+
+		/* Don't call handle_open_file if we have a mapping */
+		if(string_tree_search(&finfo->mapping_root, peeled, strlen(peeled)) == NULL) {
+			if(handle_open_file(at, peeled, finfo) < 0) {
+				/* TODO: Set failure on internal server? */
+				fprintf(stderr, "tup internal error: handle open file failed\n");
+			}
 		}
 		if(stripped) {
 			if(handle_open_file(at, stripped, finfo) < 0) {
@@ -611,6 +621,7 @@ static int tup_fs_readdir(const char *path, void *buf, fuse_fill_dir_t filler,
 	if(finfo) {
 		struct tmpdir *tmpdir;
 		struct mapping *map;
+		struct string_tree *stree;
 		struct stat st;
 
 		/* In the parser, we have to look at the tup database, not
@@ -641,22 +652,24 @@ static int tup_fs_readdir(const char *path, void *buf, fuse_fill_dir_t filler,
 		 * we need to add to the list in addition to whatever we
 		 * get from the real opendir/readdir (if applicable).
 		 */
-		LIST_FOREACH(map, &finfo->mapping_list, list) {
+		RB_FOREACH(stree, string_entries, &finfo->mapping_root) {
 			const char *realname;
+
+			map = container_of(stree, struct mapping, realname);
 
 			/* Get the 'real' realname of the file. Eg: sub/bar.txt
 			 * becomes "bar.txt" if we are doing readdir("sub").
 			 */
 			if(peeled[0] == '.') {
-				realname = map->realname;
+				realname = map->realname.s;
 			} else {
 				int len;
 				len = strlen(peeled);
-				if(strncmp(peeled, map->realname, len) != 0)
+				if(strncmp(peeled, map->realname.s, len) != 0)
 					continue;
-				if(map->realname[len] != '/')
+				if(map->realname.s[len] != '/')
 					continue;
-				realname = &map->realname[len+1];
+				realname = &map->realname.s[len+1];
 			}
 			/* Make sure we don't include "sub/dir/bar.txt" if
 			 * we are just doing readdir("sub").
@@ -748,9 +761,6 @@ static int tup_fs_mknod(const char *path, mode_t mode, dev_t rdev)
 		if(!map) {
 			return -ENOMEM;
 		} else {
-			/* TODO: Error check */
-			tup_fuse_handle_file(path, NULL, ACCESS_WRITE);
-
 			rc = openat(tup_top_fd(), map->tmpname, flags, mode);
 			if(rc < 0)
 				return -errno;
@@ -823,9 +833,8 @@ static int tup_fs_unlink(const char *path)
 		map = find_mapping(finfo, path);
 		if(map) {
 			unlinkat(tup_top_fd(), map->tmpname, 0);
-			del_map(map);
+			del_map(map, &finfo->mapping_root);
 			put_finfo(finfo);
-			tup_fuse_handle_file(path, NULL, ACCESS_UNLINK);
 			return 0;
 		}
 		put_finfo(finfo);
@@ -884,14 +893,12 @@ static int tup_fs_symlink(const char *from, const char *to)
 static int tup_fs_rename(const char *from, const char *to)
 {
 	struct file_info *finfo;
-	const char *peelfrom;
 	const char *peelto;
 	struct mapping *map;
 
 	if(context_check() < 0)
 		return -EPERM;
 
-	peelfrom = peel(from);
 	peelto = peel(to);
 
 	finfo = get_finfo(to);
@@ -906,7 +913,7 @@ static int tup_fs_rename(const char *from, const char *to)
 		map = find_mapping(finfo, to);
 		if(map) {
 			unlink(map->tmpname);
-			del_map(map);
+			del_map(map, &finfo->mapping_root);
 		}
 
 		map = find_mapping(finfo, from);
@@ -914,16 +921,22 @@ static int tup_fs_rename(const char *from, const char *to)
 			put_finfo(finfo);
 			return -ENOENT;
 		}
+		string_tree_rm(&finfo->mapping_root, &map->realname);
 
-		free(map->realname);
-		map->realname = strdup(peelto);
-		if(!map->realname) {
+		free(map->realname.s);
+		map->realname.s = strdup(peelto);
+		if(!map->realname.s) {
 			perror("strdup");
 			put_finfo(finfo);
 			return -ENOMEM;
 		}
+		map->realname.len = strlen(map->realname.s);
+		if(string_tree_insert(&finfo->mapping_root, &map->realname) < 0) {
+			fprintf(stderr, "tup internal error: Unable to insert renamed mapping into the mapping_root tree: '%s'\n", map->realname.s);
+			put_finfo(finfo);
+			return -EIO;
+		}
 
-		handle_rename(peelfrom, peelto, finfo);
 		put_finfo(finfo);
 	}
 
@@ -994,8 +1007,6 @@ static int tup_fs_truncate(const char *path, off_t size)
 	if(context_check() < 0)
 		return -EPERM;
 
-	/* TODO: error check? */
-	tup_fuse_handle_file(path, NULL, ACCESS_WRITE);
 	finfo = get_finfo(path);
 	if(finfo) {
 		map = find_mapping(finfo, path);
@@ -1053,10 +1064,9 @@ static int tup_fs_utimens(const char *path, const struct timespec ts[2])
 static int tup_fs_open(const char *path, struct fuse_file_info *fi)
 {
 	int res;
-	enum access_type at = ACCESS_READ;
 	const char *peeled;
 	const char *openfile;
-	struct mapping *map;
+	struct mapping *map = NULL;
 	struct file_info *finfo;
 	const char *variant_dir = NULL;
 	const char *stripped = NULL;
@@ -1079,8 +1089,6 @@ static int tup_fs_open(const char *path, struct fuse_file_info *fi)
 		put_finfo(finfo);
 	}
 
-	if((fi->flags & O_RDWR) || (fi->flags & O_WRONLY))
-		at = ACCESS_WRITE;
 	res = openat(tup_top_fd(), openfile, fi->flags);
 	if(res < 0 && variant_dir) {
 		stripped = prefix_strip(peeled, variant_dir);
@@ -1094,7 +1102,8 @@ static int tup_fs_open(const char *path, struct fuse_file_info *fi)
 	}
 	fi->fh = res;
 
-	tup_fuse_handle_file(path, stripped, at);
+	if(!map)
+		tup_fuse_handle_file(path, stripped, ACCESS_READ);
 	return 0;
 }
 

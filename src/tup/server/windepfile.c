@@ -483,20 +483,24 @@ static int process_depfile(struct server *s, const char *depfile)
 				perror("malloc");
 				return -1;
 			}
-			map->realname = strdup(event1);
-			if(!map->realname) {
+			map->realname.s = strdup(event1);
+			if(!map->realname.s) {
 				perror("strdup");
 				return -1;
 			}
+			map->realname.len = strlen(map->realname.s);
 			map->tmpname = strdup(event1);
 			if(!map->tmpname) {
 				perror("strdup");
 				return -1;
 			}
 			map->tent = NULL; /* This is used when saving deps */
-			LIST_INSERT_HEAD(&s->finfo.mapping_list, map, list);
+			if(string_tree_insert(&s->finfo.mapping_root, &map->realname) < 0) {
+				fprintf(stderr, "tup error: Unable to add map entry for '%s'\n", map->realname.s);
+				return -1;
+			}
 		}
-		if(handle_file(event.at, event1, event2, &s->finfo) < 0) {
+		if(handle_file(event.at, event1, &s->finfo) < 0) {
 			fprintf(stderr, "tup error: Failed to call handle_file on event '%s'\n", event1);
 			return -1;
 		}

@@ -34,12 +34,10 @@ struct tup_entry;
 struct tupid_entries;
 
 struct mapping {
-	LIST_ENTRY(mapping) list;
-	char *realname;
+	struct string_tree realname;
 	char *tmpname;
 	struct tup_entry *tent;
 };
-LIST_HEAD(mapping_head, mapping);
 
 struct tmpdir {
 	LIST_ENTRY(tmpdir) list;
@@ -57,9 +55,8 @@ struct file_info {
 	pthread_mutex_t lock;
 	struct thread_tree tnode;
 	struct string_entries read_root;
-	struct string_entries write_root;
 	struct string_entries var_root;
-	struct mapping_head mapping_list;
+	struct string_entries mapping_root;
 	struct tmpdir_head tmpdir_list;
 	const char *variant_dir;
 	int server_fail;
@@ -68,16 +65,15 @@ struct file_info {
 int init_file_info(struct file_info *info, const char *variant_dir);
 void finfo_lock(struct file_info *info);
 void finfo_unlock(struct file_info *info);
-int handle_file(enum access_type at, const char *filename, const char *file2,
-		struct file_info *info);
+int handle_file(enum access_type at, const char *filename, struct file_info *info);
 int handle_open_file(enum access_type at, const char *filename,
 		     struct file_info *info);
-int handle_rename(const char *from, const char *to, struct file_info *info);
+void ignore_read_file(const char *filename, int len, struct file_info *info);
 int write_files(FILE *f, tupid_t cmdid, struct file_info *info, int *warnings,
 		int check_only, struct tupid_entries *sticky_root,
 		struct tupid_entries *normal_root, int full_deps, tupid_t vardt);
 int add_config_files(struct file_info *finfo, struct tup_entry *tent);
 int add_parser_files(FILE *f, struct file_info *finfo, struct tupid_entries *root, tupid_t vardt);
-void del_map(struct mapping *map);
+void del_map(struct mapping *map, struct string_entries *mapping_root);
 
 #endif

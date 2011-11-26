@@ -137,8 +137,6 @@ run script share site/wiki?
 
 gimme_node_or_make_ghost - if(new_dt == 0) block never used?
 
-write_list not needed? Just use mapping list?
-
 check using mmap instead of open/read for reading in files via fslurp? Use madvise to say it's a sequential read?
 
 use strsignal: http://www.cs.utah.edu/dept/old/texinfo/glibc-manual-0.02/library_21.html#SEC343

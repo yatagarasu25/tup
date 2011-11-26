@@ -24,6 +24,6 @@ cat > Tupfile << HERE
 HERE
 tup touch bar Tupfile
 # Windows fails with 'Unspecified output files'
-update_fail_msg "\(tup error: Unable to truncate\|Unspecified output files\)"
+update_fail_msg "\(tup error: Unable to \(open\|truncate\)\|Unspecified output files\)"
 
 eotup
