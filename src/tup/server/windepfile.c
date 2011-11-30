@@ -23,6 +23,7 @@
 #include "tup/config.h"
 #include "tup/flist.h"
 #include "tup/environ.h"
+#include "tup/mapping.h"
 #include "dllinject/dllinject.h"
 #include "compat/win32/dirpath.h"
 #include "compat/win32/open_notify.h"

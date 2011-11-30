@@ -20,6 +20,8 @@
 
 #define _ATFILE_SOURCE
 #include "file.h"
+#include "access_event.h"
+#include "mapping.h"
 #include "debug.h"
 #include "db.h"
 #include "fileio.h"
@@ -375,7 +377,7 @@ static int add_parser_files_locked(FILE *f, struct file_info *finfo,
 			if(file_set_mtime(tent, map->realname.s) < 0)
 				return -1;
 		}
-		del_map(map, &finfo->mapping_root);
+		del_mapping(map, &finfo->mapping_root);
 	}
 	if(map_bork)
 		return -1;
@@ -416,14 +418,6 @@ static void del_entry(struct file_entry *fent, struct string_entries *root)
 	del_pel_group(&fent->pg);
 	free(fent->filename.s);
 	free(fent);
-}
-
-void del_map(struct mapping *map, struct string_entries *mapping_root)
-{
-	string_tree_rm(mapping_root, &map->realname);
-	free(map->tmpname);
-	free(map->realname.s);
-	free(map);
 }
 
 static int update_write_info(FILE *f, tupid_t cmdid, struct file_info *info,
@@ -477,7 +471,7 @@ static int update_write_info(FILE *f, tupid_t cmdid, struct file_info *info,
 		while((st = RB_ROOT(&info->mapping_root)) != NULL) {
 			map = container_of(st, struct mapping, realname);
 			unlink(map->tmpname);
-			del_map(map, &info->mapping_root);
+			del_mapping(map, &info->mapping_root);
 		}
 		return -1;
 	}
@@ -501,7 +495,7 @@ static int update_write_info(FILE *f, tupid_t cmdid, struct file_info *info,
 			if(file_set_mtime(map->tent, map->realname.s) < 0)
 				return -1;
 		}
-		del_map(map, &info->mapping_root);
+		del_mapping(map, &info->mapping_root);
 	}
 
 	if(write_bork)

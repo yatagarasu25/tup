@@ -29,6 +29,10 @@
 #include "compat/utimensat.h"
 #include "tup_fuse_fs.h"
 #include "tup/config.h"
+#include "tup/file.h"
+#include "tup/mapping.h"
+#include "tup/fileio.h"
+#include "tup/thread_tree.h"
 #include "tup/debug.h"
 #include "tup/server.h"
 #include "tup/container.h"
@@ -146,7 +150,7 @@ static const char *prefix_strip(const char *peeled, const char *variant_dir)
 	return NULL;
 }
 
-static struct mapping *add_mapping(const char *path)
+static struct mapping *create_map(const char *path)
 {
 	static int filenum = 0;
 	static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
@@ -155,48 +159,25 @@ static struct mapping *add_mapping(const char *path)
 
 	finfo = get_finfo(path);
 	if(finfo) {
-		int size;
 		int myfile;
 		const char *peeled;
+		char tmpname[sizeof(int) * 2 + sizeof(TUP_TMP) + 1];
 
 		peeled = peel(path);
-
-		map = malloc(sizeof *map);
-		if(!map) {
-			perror("malloc");
-			goto out_err;
-		}
-		map->realname.s = strdup(peeled);
-		if(!map->realname.s) {
-			perror("strdup");
-			goto out_err;
-		}
-		map->realname.len = strlen(map->realname.s);
-
-		size = sizeof(int) * 2 + sizeof(TUP_TMP) + 1;
-		map->tmpname = malloc(size);
-		if(!map->tmpname) {
-			perror("malloc");
-			goto out_err;
-		}
-		map->tent = NULL; /* This is used when saving dependencies */
 
 		pthread_mutex_lock(&lock);
 		myfile = filenum;
 		filenum++;
 		pthread_mutex_unlock(&lock);
 
-		if(snprintf(map->tmpname, size, TUP_TMP "/%x", myfile) >= size) {
+		if(snprintf(tmpname, sizeof(tmpname), TUP_TMP "/%x", myfile) >= (signed)sizeof(tmpname)) {
 			fprintf(stderr, "tup internal error: mapping tmpname is sized incorrectly.\n");
 			goto out_err;
 		}
 
-		if(string_tree_insert(&finfo->mapping_root, &map->realname) < 0) {
-			fprintf(stderr, "tup internal error: Unable to add map entry for '%s'\n", path);
-			goto out_err;
-		}
-
-		ignore_read_file(map->realname.s, map->realname.len, finfo);
+		map = add_mapping(peeled, tmpname, &finfo->mapping_root);
+		if(map)
+			ignore_read_file(map->realname.s, map->realname.len, finfo);
 		put_finfo(finfo);
 	}
 	return map;
@@ -208,15 +189,7 @@ out_err:
 
 static struct mapping *find_mapping(struct file_info *finfo, const char *path)
 {
-	const char *peeled;
-	struct string_tree *st;
-
-	peeled = peel(path);
-	st = string_tree_search(&finfo->mapping_root, peeled, strlen(peeled));
-	if(st) {
-		return container_of(st, struct mapping, realname);
-	}
-	return NULL;
+	return get_mapping(peel(path), &finfo->mapping_root);
 }
 
 static int context_check(void)
@@ -757,7 +730,7 @@ static int tup_fs_mknod(const char *path, mode_t mode, dev_t rdev)
 	   is more portable */
 	if (S_ISREG(mode)) {
 		int flags = O_CREAT | O_EXCL | O_WRONLY;
-		map = add_mapping(path);
+		map = create_map(path);
 		if(!map) {
 			return -ENOMEM;
 		} else {
@@ -768,7 +741,7 @@ static int tup_fs_mknod(const char *path, mode_t mode, dev_t rdev)
 				return -errno;
 		}
 	} else if S_ISFIFO(mode) {
-		map = add_mapping(path);
+		map = create_map(path);
 		if(!map) {
 			return -ENOMEM;
 		} else {
@@ -833,7 +806,7 @@ static int tup_fs_unlink(const char *path)
 		map = find_mapping(finfo, path);
 		if(map) {
 			unlinkat(tup_top_fd(), map->tmpname, 0);
-			del_map(map, &finfo->mapping_root);
+			del_mapping(map, &finfo->mapping_root);
 			put_finfo(finfo);
 			return 0;
 		}
@@ -878,7 +851,7 @@ static int tup_fs_symlink(const char *from, const char *to)
 	if(context_check() < 0)
 		return -EPERM;
 
-	tomap = add_mapping(to);
+	tomap = create_map(to);
 	if(!tomap) {
 		return -ENOMEM;
 	}
@@ -913,7 +886,7 @@ static int tup_fs_rename(const char *from, const char *to)
 		map = find_mapping(finfo, to);
 		if(map) {
 			unlink(map->tmpname);
-			del_map(map, &finfo->mapping_root);
+			del_mapping(map, &finfo->mapping_root);
 		}
 
 		map = find_mapping(finfo, from);

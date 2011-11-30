@@ -33,12 +33,6 @@
 struct tup_entry;
 struct tupid_entries;
 
-struct mapping {
-	struct string_tree realname;
-	char *tmpname;
-	struct tup_entry *tent;
-};
-
 struct tmpdir {
 	LIST_ENTRY(tmpdir) list;
 	char *dirname;
@@ -74,6 +68,5 @@ int write_files(FILE *f, tupid_t cmdid, struct file_info *info, int *warnings,
 		struct tupid_entries *normal_root, int full_deps, tupid_t vardt);
 int add_config_files(struct file_info *finfo, struct tup_entry *tent);
 int add_parser_files(FILE *f, struct file_info *finfo, struct tupid_entries *root, tupid_t vardt);
-void del_map(struct mapping *map, struct string_entries *mapping_root);
 
 #endif
