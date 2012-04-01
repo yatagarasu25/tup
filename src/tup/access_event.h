@@ -35,7 +35,6 @@
 enum access_type {
 	ACCESS_READ,
 	ACCESS_WRITE,
-	ACCESS_RENAME,
 	ACCESS_UNLINK,
 	ACCESS_VAR,
 };

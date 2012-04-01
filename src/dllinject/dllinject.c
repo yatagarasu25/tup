@@ -21,7 +21,9 @@
 
 #define BUILDING_DLLINJECT
 #include "dllinject.h"
+#include "win_handle_map.h"
 #include "tup/access_event.h"
+#include "tup/mapping.h"
 
 #include <windows.h>
 #include <ntdef.h>
@@ -32,6 +34,7 @@
 #include <stdint.h>
 #include <ctype.h>
 #include <shlwapi.h>
+#include <ddk/ntapi.h>
 
 #ifndef __in
 #define __in
@@ -48,7 +51,6 @@
 static const char* access_type_name[] = {
 	"read",
 	"write",
-	"rename",
 	"unlink",
 	"var",
 };
@@ -88,6 +90,7 @@ typedef HFILE (WINAPI *OpenFile_t)(
     __inout LPOFSTRUCT lpReOpenBuff,
     __in    UINT uStyle);
 
+#if 0
 typedef HANDLE (WINAPI *CreateFileA_t)(
     __in     LPCSTR lpFileName,
     __in     DWORD dwDesiredAccess,
@@ -129,6 +132,7 @@ typedef HANDLE (WINAPI *CreateFileTransactedW_t)(
     __in       HANDLE hTransaction,
     __in_opt   PUSHORT pusMiniVersion,
     __reserved PVOID  lpExtendedParameter);
+#endif
 
 typedef BOOL (WINAPI *DeleteFileA_t)(
     __in LPCSTR lpFileName);
@@ -359,7 +363,6 @@ typedef BOOL (WINAPI *CreateProcessWithTokenW_t)(
     __in        LPSTARTUPINFOW lpStartupInfo,
     __out       LPPROCESS_INFORMATION lpProcessInformation);
 
-typedef void *PIO_STATUS_BLOCK;
 typedef NTSTATUS (WINAPI *NtOpenFile_t)(
     __out  PHANDLE FileHandle,
     __in   ACCESS_MASK DesiredAccess,
@@ -381,16 +384,31 @@ typedef NTSTATUS (WINAPI *NtCreateFile_t)(
     __in      PVOID EaBuffer,
     __in      ULONG EaLength);
 
+typedef NTSTATUS (WINAPI *NtQueryDirectoryFile_t)(
+   __in      HANDLE FileHandle,
+   __in_opt  HANDLE Event,
+   __in_opt  PIO_APC_ROUTINE ApcRoutine,
+   __in_opt  PVOID ApcContext,
+   __out     PIO_STATUS_BLOCK IoStatusBlock,
+   __out     PVOID FileInformation,
+   __in      ULONG Length,
+   __in      FILE_INFORMATION_CLASS FileInformationClass,
+   __in      BOOLEAN ReturnSingleEntry,
+   __in_opt  PUNICODE_STRING FileName,
+   __in      BOOLEAN RestartScan);
+
 typedef int (*access_t)(const char *pathname, int mode);
 typedef FILE *(*fopen_t)(const char *path, const char *mode);
 typedef int (*rename_t)(const char *oldpath, const char *newpath);
 typedef int (*remove_t)(const char *pathname);
 
 static OpenFile_t			OpenFile_orig;
+#if 0
 static CreateFileA_t			CreateFileA_orig;
 static CreateFileW_t			CreateFileW_orig;
 static CreateFileTransactedA_t		CreateFileTransactedA_orig;
 static CreateFileTransactedW_t		CreateFileTransactedW_orig;
+#endif
 static DeleteFileA_t			DeleteFileA_orig;
 static DeleteFileW_t			DeleteFileW_orig;
 static DeleteFileTransactedA_t		DeleteFileTransactedA_orig;
@@ -427,6 +445,7 @@ static CreateProcessWithLogonW_t	CreateProcessWithLogonW_orig;
 static CreateProcessWithTokenW_t	CreateProcessWithTokenW_orig;
 static NtCreateFile_t			NtCreateFile_orig;
 static NtOpenFile_t			NtOpenFile_orig;
+static NtQueryDirectoryFile_t		NtQueryDirectoryFile_orig;
 static access_t				_access_orig;
 static fopen_t				fopen_orig;
 static rename_t				rename_orig;
@@ -434,18 +453,20 @@ static remove_t				remove_orig;
 
 #define handle_file(a, b, c) mhandle_file(a, b, c, __LINE__)
 static void mhandle_file(const char* file, const char* file2, enum access_type at, int line);
-static void handle_file_w(const wchar_t* file, const wchar_t* file2, enum access_type at);
+#define handle_file_w(a, b, c) mhandle_file_w(a, b, c, __LINE__)
+static void mhandle_file_w(const wchar_t* file, const wchar_t* file2, enum access_type at, int line);
 
 static const char *strcasestr(const char *arg1, const char *arg2);
 static const wchar_t *wcscasestr(const wchar_t *arg1, const wchar_t *arg2);
+static int pre_process_mappings(void);
 
 static char s_depfilename[PATH_MAX];
-static HANDLE deph = INVALID_HANDLE_VALUE;
+static FILE *depf = NULL;
 
 static int writef(const char *data, unsigned int len)
 {
 	int rc = 0;
-	DWORD num_written;
+/*	DWORD num_written;
 
 	if(!WriteFile(deph, data, len, &num_written, NULL)) {
 		DEBUG_HOOK("failed to write %i bytes\n", len);
@@ -454,8 +475,219 @@ static int writef(const char *data, unsigned int len)
 	if(num_written != len) {
 		DEBUG_HOOK("failed to write exactly %i bytes\n", len);
 		rc = -1;
-	}
+	}*/
+	pre_process_mappings();
+	fwrite(data, len, 1, depf);
+	fseek(depf, 0, SEEK_END);
+	fflush(depf);
 	return rc;
+}
+
+static int sid;
+static struct string_entries mapping_root = RB_INITIALIZER(&mapping_root);
+
+static char execdir[MAX_PATH];
+static char tmpdir[MAX_PATH];
+
+/* Bit 29 is the application error bit, and just set it with our line number. Add
+ * in bit 28 for funsies in case the real application uses just bit 29.
+ */
+#define SET_ERROR() SetLastError(0x30000000 | __LINE__)
+
+static int fileid = 0;
+
+static int pre_process_mappings(void)
+{
+	char event1[PATH_MAX];
+	char event2[PATH_MAX];
+
+	while(1) {
+		struct access_event event;
+		if(fread(&event, sizeof(event), 1, depf) != 1) {
+			if(!feof(depf)) {
+				perror("fread");
+				return -1;
+			}
+			break;
+		}
+		if(!event.len)
+			continue;
+		if(fread(&event1, event.len + 1, 1, depf) != 1) {
+			perror("fread");
+			return -1;
+		}
+		if(fread(&event2, event.len2 + 1, 1, depf) != 1) {
+			perror("fread");
+			return -1;
+		}
+		if(event.at == ACCESS_WRITE) {
+			DEBUG_HOOK("New mapping (pre-process)[%i]: %s -> %s\n", GetCurrentProcessId(), event1, event2);
+			if(!add_mapping(event1, event2, &mapping_root)) {
+				fprintf(stderr, "Unable to add pre-map for %s\n", event1);
+				return -1;
+			}
+			fileid++;
+		}
+	}
+	return 0;
+}
+
+static struct mapping *mget_mapping(const char *path, struct string_entries *mroot)
+{
+	if(pre_process_mappings() < 0)
+		return NULL;
+	return get_mapping(path, mroot);
+}
+
+#define tup_get_write(a) __tup_get_write(a, __LINE__)
+static LPCSTR __tup_get_write(__in LPCSTR filename, int line)
+{
+	struct mapping *map;
+
+	if(strcmp(filename, "CONOUT$") == 0)
+		return filename;
+
+	DEBUG_HOOK("Get[%i] mapping (write)[%i]: %s\n", line, GetCurrentProcessId(), filename);
+	map = mget_mapping(filename, &mapping_root);
+	if(!map) {
+		char tmpfilename[PATH_MAX];
+		fileid++;
+		snprintf(tmpfilename, sizeof(tmpfilename), "%s\\%i-%x", tmpdir, sid, fileid);
+		DEBUG_HOOK("New mapping[%i]: %s -> %s\n", GetCurrentProcessId(), filename, tmpfilename);
+		map = add_mapping(filename, tmpfilename, &mapping_root);
+		handle_file(filename, tmpfilename, ACCESS_WRITE);
+	}
+	return map->tmpname;
+}
+
+static LPCSTR tup_get_write_w(__in LPCWSTR filename)
+{
+	char afile[PATH_MAX];
+	size_t fsz = filename ? wcslen(filename) : 0;
+	int count;
+	count = WideCharToMultiByte(CP_UTF8, 0, filename, fsz, afile, PATH_MAX, NULL, NULL);
+	afile[count] = 0;
+	return tup_get_write(afile);
+}
+
+static LPCSTR tup_get_read_no_handle(__in LPCSTR filename)
+{
+	struct mapping *map;
+	DEBUG_HOOK("Get mapping (read no h)[%i]: %s\n", GetCurrentProcessId(), filename);
+	map = mget_mapping(filename, &mapping_root);
+	if(map) {
+		return map->tmpname;
+	}
+	return filename;
+}
+
+static LPCSTR tup_get_read_no_handle_w(__in LPCWSTR filename, char *outfile)
+{
+	size_t fsz = filename ? wcslen(filename) : 0;
+	int count;
+	count = WideCharToMultiByte(CP_UTF8, 0, filename, fsz, outfile, PATH_MAX, NULL, NULL);
+	outfile[count] = 0;
+	return tup_get_read_no_handle(outfile);
+}
+
+static LPCSTR tup_get_read(__in LPCSTR filename)
+{
+	struct mapping *map;
+	DEBUG_HOOK("Get mapping (read)[%i]: %s\n", GetCurrentProcessId(), filename);
+	map = mget_mapping(filename, &mapping_root);
+	if(map) {
+		/* If we have a mapping, that means we're writing to the file
+		 * and don't need to call handle_file().
+		 */
+		return map->tmpname;
+	}
+	handle_file(filename, NULL, ACCESS_READ);
+	return filename;
+}
+
+static LPCSTR tup_get_read_w(__in LPCWSTR filename, char *outfile)
+{
+	size_t fsz = filename ? wcslen(filename) : 0;
+	int count;
+	count = WideCharToMultiByte(CP_UTF8, 0, filename, fsz, outfile, PATH_MAX, NULL, NULL);
+	outfile[count] = 0;
+	return tup_get_read(outfile);
+}
+
+static BOOL tup_unlink(__in LPCSTR filename)
+{
+	struct mapping *map;
+	DEBUG_HOOK("unlink: %s\n", filename);
+	map = mget_mapping(filename, &mapping_root);
+	if(map) {
+		/* The file is cleaned up in the server when it sees the ACCESS_UNLINK path */
+		del_mapping(map, &mapping_root);
+		handle_file(filename, NULL, ACCESS_UNLINK);
+		return TRUE;
+	}
+	SET_ERROR();
+	return FALSE;
+}
+
+static BOOL tup_unlink_w(__in LPCWSTR filename)
+{
+	char afile[PATH_MAX];
+	size_t fsz = wcslen(filename);
+	int count;
+
+	count = WideCharToMultiByte(CP_UTF8, 0, filename, fsz, afile, PATH_MAX, NULL, NULL);
+	afile[count] = 0;
+	DEBUG_HOOK("unlinkW: %s\n", afile);
+	return tup_unlink(afile);
+}
+
+static BOOL tup_rename(__in LPCSTR lpExistingFileName, __in LPCSTR lpNewFileName)
+{
+	struct mapping *map;
+
+	DEBUG_HOOK("Rename: '%s' -> '%s'\n", lpExistingFileName, lpNewFileName);
+	/* See if we already have a file at the new destination. If so, remove
+	 * it.
+	 */
+	map = mget_mapping(lpNewFileName, &mapping_root);
+	if(map) {
+		DeleteFileA_orig(map->tmpname);
+		del_mapping(map, &mapping_root);
+	}
+
+	map = mget_mapping(lpExistingFileName, &mapping_root);
+	if(!map) {
+		SET_ERROR();
+		return FALSE;
+	}
+	string_tree_rm(&mapping_root, &map->realname);
+	free(map->realname.s);
+	map->realname.s = strdup(lpNewFileName);
+	if(!map->realname.s) {
+		SET_ERROR();
+		return FALSE;
+	}
+	map->realname.len = strlen(map->realname.s);
+	if(string_tree_insert(&mapping_root, &map->realname) < 0) {
+		SET_ERROR();
+		return FALSE;
+	}
+	return TRUE;
+}
+
+static BOOL tup_rename_w(__in LPCWSTR lpExistingFileName, __in LPCWSTR lpNewFileName)
+{
+	char afile[PATH_MAX];
+	char afile2[PATH_MAX];
+	size_t fsz = wcslen(lpExistingFileName);
+	size_t f2sz = wcslen(lpNewFileName);
+	int count;
+
+	count = WideCharToMultiByte(CP_UTF8, 0, lpExistingFileName, fsz, afile, PATH_MAX, NULL, NULL);
+	afile[count] = 0;
+	count = WideCharToMultiByte(CP_UTF8, 0, lpNewFileName, f2sz, afile2, PATH_MAX, NULL, NULL);
+	afile2[count] = 0;
+	return tup_rename(afile, afile2);
 }
 
 /* -------------------------------------------------------------------------- */
@@ -465,22 +697,22 @@ static HFILE WINAPI OpenFile_hook(
     __inout LPOFSTRUCT lpReOpenBuff,
     __in    UINT uStyle)
 {
-	if (uStyle & OF_DELETE) {
-		handle_file(lpFileName, NULL, ACCESS_UNLINK);
-	} else if (uStyle & (OF_READWRITE | OF_WRITE | OF_SHARE_DENY_WRITE | OF_SHARE_EXCLUSIVE | OF_CREATE)) {
-		handle_file(lpFileName, NULL, ACCESS_WRITE);
+	LPCSTR realName;
+	if (uStyle & (OF_READWRITE | OF_WRITE | OF_SHARE_DENY_WRITE | OF_SHARE_EXCLUSIVE | OF_CREATE)) {
+		realName = tup_get_write(lpFileName);
 	} else {
-		handle_file(lpFileName, NULL, ACCESS_READ);
+		realName = tup_get_read(lpFileName);
 	}
 
 	return OpenFile_orig(
-		lpFileName,
+		realName,
 		lpReOpenBuff,
 		uStyle);
 }
 
 /* -------------------------------------------------------------------------- */
 
+#if 0
 static HANDLE WINAPI CreateFileA_hook(
     __in     LPCSTR lpFileName,
     __in     DWORD dwDesiredAccess,
@@ -490,8 +722,17 @@ static HANDLE WINAPI CreateFileA_hook(
     __in     DWORD dwFlagsAndAttributes,
     __in_opt HANDLE hTemplateFile)
 {
-	HANDLE h = CreateFileA_orig(
-		lpFileName,
+	HANDLE h;
+	LPCSTR realName;
+
+	if (dwDesiredAccess & GENERIC_WRITE) {
+		realName = tup_get_write(lpFileName);
+	} else {
+		realName = tup_get_read(lpFileName);
+	}
+
+	h = CreateFileA_orig(
+		realName,
 		dwDesiredAccess,
 		dwShareMode,
 		lpSecurityAttributes,
@@ -508,12 +749,6 @@ static HANDLE WINAPI CreateFileA_hook(
 		dwCreationDisposition,
 		dwFlagsAndAttributes);
 
-	if (h != INVALID_HANDLE_VALUE && dwDesiredAccess & GENERIC_WRITE) {
-		handle_file(lpFileName, NULL, ACCESS_WRITE);
-	} else {
-		handle_file(lpFileName, NULL, ACCESS_READ);
-	}
-
 	return h;
 }
 
@@ -529,20 +764,24 @@ static HANDLE WINAPI CreateFileW_hook(
     __in     DWORD dwFlagsAndAttributes,
     __in_opt HANDLE hTemplateFile)
 {
-	HANDLE h = CreateFileW_orig(
-		lpFileName,
+	HANDLE h;
+	LPCSTR realName;
+	char buf[PATH_MAX];
+
+	if (dwDesiredAccess & GENERIC_WRITE) {
+		realName = tup_get_write_w(lpFileName);
+	} else {
+		realName = tup_get_read_w(lpFileName, buf);
+	}
+
+	h = CreateFileA_orig(
+		realName,
 		dwDesiredAccess,
 		dwShareMode,
 		lpSecurityAttributes,
 		dwCreationDisposition,
 		dwFlagsAndAttributes,
 		hTemplateFile);
-
-	if (h != INVALID_HANDLE_VALUE && dwDesiredAccess & GENERIC_WRITE) {
-		handle_file_w(lpFileName, NULL, ACCESS_WRITE);
-	} else {
-		handle_file_w(lpFileName, NULL, ACCESS_READ);
-	}
 
 	return h;
 }
@@ -561,8 +800,17 @@ HANDLE WINAPI CreateFileTransactedA_hook(
     __in_opt   PUSHORT pusMiniVersion,
     __reserved PVOID  lpExtendedParameter)
 {
-	HANDLE h = CreateFileTransactedA_orig(
-		lpFileName,
+	HANDLE h;
+	LPCSTR realName;
+
+	if (dwDesiredAccess & GENERIC_WRITE) {
+		realName = tup_get_write(lpFileName);
+	} else {
+		realName = tup_get_read(lpFileName);
+	}
+
+	h = CreateFileTransactedA_orig(
+		realName,
 		dwDesiredAccess,
 		dwShareMode,
 		lpSecurityAttributes,
@@ -572,12 +820,6 @@ HANDLE WINAPI CreateFileTransactedA_hook(
 		hTransaction,
 		pusMiniVersion,
 		lpExtendedParameter);
-
-	if (h != INVALID_HANDLE_VALUE && dwDesiredAccess & GENERIC_WRITE) {
-		handle_file(lpFileName, NULL, ACCESS_WRITE);
-	} else {
-		handle_file(lpFileName, NULL, ACCESS_READ);
-	}
 
 	return h;
 }
@@ -594,8 +836,18 @@ HANDLE WINAPI CreateFileTransactedW_hook(
     __in_opt   PUSHORT pusMiniVersion,
     __reserved PVOID  lpExtendedParameter)
 {
-	HANDLE h = CreateFileTransactedW_orig(
-		lpFileName,
+	HANDLE h;
+	LPCSTR realName;
+	char buf[PATH_MAX];
+
+	if (dwDesiredAccess & GENERIC_WRITE) {
+		realName = tup_get_write_w(lpFileName);
+	} else {
+		realName = tup_get_read_w(lpFileName, buf);
+	}
+
+	h = CreateFileTransactedA_orig(
+		realName,
 		dwDesiredAccess,
 		dwShareMode,
 		lpSecurityAttributes,
@@ -606,19 +858,16 @@ HANDLE WINAPI CreateFileTransactedW_hook(
 		pusMiniVersion,
 		lpExtendedParameter);
 
-	if (h != INVALID_HANDLE_VALUE && dwDesiredAccess & GENERIC_WRITE) {
-		handle_file_w(lpFileName, NULL, ACCESS_WRITE);
-	} else {
-		handle_file_w(lpFileName, NULL, ACCESS_READ);
-	}
-
 	return h;
 }
+#endif
 
 static char *unicode_to_ansi(PUNICODE_STRING uni)
 {
 	int len;
 	char *name = NULL;
+	if(!uni)
+		return NULL;
 
 	len = WideCharToMultiByte(CP_UTF8, 0, uni->Buffer, uni->Length / sizeof(wchar_t), 0, 0, NULL, NULL);
 	if(len > 0) {
@@ -627,6 +876,24 @@ static char *unicode_to_ansi(PUNICODE_STRING uni)
 		name[len] = 0;
 	}
 	return name;
+}
+
+static void ansi_to_unicode(const char *ansi, PUNICODE_STRING uni, int append)
+{
+	int new_bytes;
+	if(!append)
+		uni->Length = 0;
+	new_bytes = MultiByteToWideChar(CP_UTF8, 0, ansi, -1, uni->Buffer + (uni->Length / sizeof(WCHAR)), uni->MaximumLength - uni->Length);
+
+	/* Adjust for the fact that nul-terminators aren't counted */
+	new_bytes--;
+
+	/* Adjust for the fact that MultiByteToWideChar counts unicode characters,
+	 * but UNICODE_STRING counts bytes (except for nul-terminators).
+	 */
+	new_bytes *= sizeof(WCHAR);
+
+	uni->Length += new_bytes;
 }
 
 NTSTATUS WINAPI NtCreateFile_hook(
@@ -642,26 +909,23 @@ NTSTATUS WINAPI NtCreateFile_hook(
     __in      PVOID EaBuffer,
     __in      ULONG EaLength)
 {
-	NTSTATUS rc = NtCreateFile_orig(FileHandle,
-					DesiredAccess,
-					ObjectAttributes,
-					IoStatusBlock,
-					AllocationSize,
-					FileAttributes,
-					ShareAccess,
-					CreateDisposition,
-					CreateOptions,
-					EaBuffer,
-					EaLength);
+	WCHAR buf[PATH_MAX];
+	UNICODE_STRING uni;
+	NTSTATUS rc = -1;
 	char *ansi;
+
+	uni.Buffer = buf;
+	uni.MaximumLength = PATH_MAX * sizeof(WCHAR);
 
 	ansi = unicode_to_ansi(ObjectAttributes->ObjectName);
 
 	if(ansi)  {
 		const char *name = ansi;
+		LPCSTR realName;
+		int questions = 0;
 
-		DEBUG_HOOK("NtCreateFile[%i] '%s': %x, %x, %x\n", rc, ansi, ShareAccess, DesiredAccess, CreateOptions);
 		if(strncmp(name, "\\??\\", 4) == 0) {
+			questions = 1;
 			name += 4;
 			/* Windows started trying to read a file called
 			 * "\??\Ip", which broke some of the tests. This just
@@ -672,11 +936,40 @@ NTSTATUS WINAPI NtCreateFile_hook(
 				goto out_free;
 		}
 
-		if (rc == STATUS_SUCCESS && DesiredAccess & GENERIC_WRITE) {
-			handle_file(name, NULL, ACCESS_WRITE);
+		DEBUG_HOOK("ROOT DIR: %p\n", ObjectAttributes->RootDirectory);
+		if(DesiredAccess & GENERIC_WRITE) {
+			SECURITY_QUALITY_OF_SERVICE *tmp = ObjectAttributes->SecurityQualityOfService;
+			DEBUG_HOOK("Set root dir to NULL\n");
+			realName = tup_get_write(name);
+			ObjectAttributes->RootDirectory = NULL;
+			questions = 1;
+			DEBUG_HOOK("NtCreate options: %p, %08x, %p, %p, %08x, %08x, %08x, %i, %08x {%i, %i, %i,}, %08x\n", ObjectAttributes->RootDirectory, ObjectAttributes->Attributes, ObjectAttributes->SecurityDescriptor, ObjectAttributes->SecurityQualityOfService, CreateOptions, CreateDisposition, ShareAccess, EaLength, DesiredAccess, tmp->ImpersonationLevel, tmp->ContextTrackingMode, tmp->EffectiveOnly, AllocationSize);
 		} else {
-			handle_file(name, NULL, ACCESS_READ);
+			DEBUG_HOOK("Filename is read\n");
+			realName = tup_get_read(name);
 		}
+		if(questions) {
+			ansi_to_unicode("\\??\\", &uni, 0);
+		}
+		ansi_to_unicode(realName, &uni, questions);
+		DEBUG_HOOK("UNI: %ls [%i]\n", uni.Buffer, uni.Length);
+
+		ObjectAttributes->ObjectName = &uni;
+
+		rc = NtCreateFile_orig(FileHandle,
+				       DesiredAccess,
+				       ObjectAttributes,
+				       IoStatusBlock,
+				       AllocationSize,
+				       FileAttributes,
+				       ShareAccess,
+				       CreateDisposition,
+				       CreateOptions,
+				       EaBuffer,
+				       EaLength);
+
+		DEBUG_HOOK("ERror: %i\n", GetLastError());
+		DEBUG_HOOK("NtCreateFile[%08x] '%s': %x, %x, %x\n", rc, ansi, ShareAccess, DesiredAccess, CreateOptions);
 out_free:
 		free(ansi);
 	}
@@ -692,28 +985,35 @@ NTSTATUS WINAPI NtOpenFile_hook(
     __in   ULONG ShareAccess,
     __in   ULONG OpenOptions)
 {
-	NTSTATUS rc = NtOpenFile_orig(FileHandle,
-				      DesiredAccess,
-				      ObjectAttributes,
-				      IoStatusBlock,
-				      ShareAccess,
-				      OpenOptions);
+	WCHAR buf[PATH_MAX];
+	UNICODE_STRING uni;
+	NTSTATUS rc = -1;
 	char *ansi;
 
+	uni.Buffer = buf;
+	uni.MaximumLength = PATH_MAX * sizeof(WCHAR);
+
 	ansi = unicode_to_ansi(ObjectAttributes->ObjectName);
+	DEBUG_HOOK("--------------------------\n");
+	DEBUG_HOOK("NtOpenFile [%i] (%s)\n", GetCurrentProcessId(), ansi);
 
 	if(ansi) {
 		const char *name = ansi;
+		LPCSTR realName = NULL;
+		int questions = 0;
 
-		DEBUG_HOOK("NtOpenFile[%i] '%s': %x, %x, %x\n", rc, ansi, ShareAccess, DesiredAccess, OpenOptions);
+		DEBUG_HOOK(" -- a\n");
 		if(strncmp(name, "\\??\\", 4) == 0) {
+			questions = 1;
 			name += 4;
 			/* Windows started trying to read a file called "\??\Ip",
 			 * which broke some of the tests. This just skips
 			 * anything that doesn't begin with something like "C:"
 			 */
+		DEBUG_HOOK(" -- b\n");
 			if(name[0] != 0 && name[1] != ':')
 				goto out_free;
+		DEBUG_HOOK(" -- c\n");
 		}
 
 		/* The ShareAccess == FILE_SHARE_DELETE check might be
@@ -727,7 +1027,9 @@ NTSTATUS WINAPI NtOpenFile_hook(
 		 */
 		if(ShareAccess == FILE_SHARE_DELETE ||
 		   DesiredAccess & DELETE) {
-			handle_file(name, NULL, ACCESS_UNLINK);
+			DEBUG_HOOK("NtOpenFile -- delete '%s'\n", name);
+			tup_unlink(name);
+			goto out_free;
 		} else if(OpenOptions & FILE_OPEN_FOR_BACKUP_INTENT) {
 			/* The MSVC linker seems to successfully open
 			 * "prog.ilk" for reading (when linking "prog.exe"),
@@ -735,64 +1037,177 @@ NTSTATUS WINAPI NtOpenFile_hook(
 			 * It seems that this flag is used for temporary files,
 			 * so that should be safe to ignore.
 			 */
+			struct mapping *map;
+		DEBUG_HOOK(" -- d\n");
+			map = mget_mapping(name, &mapping_root);
+			if(map) {
+				realName = map->tmpname;
+		DEBUG_HOOK(" -- e: %s\n", realName);
+			}
 		} else {
-			if (rc == STATUS_SUCCESS && DesiredAccess & GENERIC_WRITE) {
-				handle_file(name, NULL, ACCESS_WRITE);
+			if (DesiredAccess & GENERIC_WRITE) {
+		DEBUG_HOOK(" -- f\n");
+				realName = tup_get_write(name);
 			} else {
-				handle_file(name, NULL, ACCESS_READ);
+		DEBUG_HOOK(" -- g\n");
+				realName = tup_get_read(name);
 			}
 		}
+		if(realName) {
+			if(questions) {
+				ansi_to_unicode("\\??\\", &uni, 0);
+			}
+			ansi_to_unicode(realName, &uni, questions);
+			DEBUG_HOOK("Previous length: %i\n", ObjectAttributes->ObjectName->Length);
+			ObjectAttributes->ObjectName = &uni;
+		}
+
+		DEBUG_HOOK(" - open realName: '%s'\n", realName);
+		{
+			char *tmp;
+			tmp = unicode_to_ansi(ObjectAttributes->ObjectName);
+			DEBUG_HOOK("TMPTMPTMP[%i, %i]: '%s'\n", ObjectAttributes->ObjectName->Length, ObjectAttributes->ObjectName->MaximumLength, tmp);
+			free(tmp);
+		}
+
+		rc = NtOpenFile_orig(FileHandle,
+				     DesiredAccess,
+				     ObjectAttributes,
+				     IoStatusBlock,
+				     ShareAccess,
+				     OpenOptions);
+		if(rc == 0) {
+			if(add_win_handle_map((unsigned long)*FileHandle, ansi) < 0) {
+				SET_ERROR();
+				rc = -1;
+			}
+		}
+		DEBUG_HOOK("NtOpenFile[%i] '%s': %x, %x, %x, handle=%p\n", rc, ansi, ShareAccess, DesiredAccess, OpenOptions, *FileHandle);
 out_free:
 		free(ansi);
 	}
+	DEBUG_HOOK("------------------------\n");
 
 	return rc;
 }
 
+NTSTATUS WINAPI NtQueryDirectoryFile_hook(
+    __in      HANDLE FileHandle,
+    __in_opt  HANDLE Event,
+    __in_opt  PIO_APC_ROUTINE ApcRoutine,
+    __in_opt  PVOID ApcContext,
+    __out     PIO_STATUS_BLOCK IoStatusBlock,
+    __out     PVOID FileInformation,
+    __in      ULONG Length,
+    __in      FILE_INFORMATION_CLASS FileInformationClass,
+    __in      BOOLEAN ReturnSingleEntry,
+    __in_opt  PUNICODE_STRING FileName,
+    __in      BOOLEAN RestartScan
+)
+{
+	NTSTATUS rc;
+	char *ansi;
+	char ansipath[PATH_MAX];
+	const char *path;
+	int pathlen;
+	WCHAR buf[PATH_MAX] = L"UNSET";
+	UNICODE_STRING uni;
+	HANDLE tmph = INVALID_HANDLE_VALUE;
+	struct mapping *map;
+
+	uni.Buffer = buf;
+	uni.MaximumLength = PATH_MAX * sizeof(WCHAR);
+
+	path = win_handle_path((unsigned long)FileHandle);
+	if(!path) {
+		SET_ERROR();
+		return -1;
+	}
+	pathlen = strlen(path);
+	if(pathlen >= PATH_MAX) {
+		SET_ERROR();
+		return -1;
+	}
+
+	/* path+4 == skip "\??\" */
+	memcpy(ansipath, path+4, pathlen-4);
+
+	ansi = unicode_to_ansi(FileName);
+	strcpy(ansipath + pathlen-4, ansi);
+	map = get_mapping(ansipath, &mapping_root);
+	if(map) {
+		const char *lastslash = strrchr(map->tmpname, '\\');
+		if(lastslash)
+			lastslash++;
+		else
+			lastslash = map->tmpname;
+		ansi_to_unicode(lastslash, &uni, 0);
+		FileName = &uni;
+		tmph = CreateFile(tmpdir, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, NULL);
+	} else {
+		tmph = FileHandle;
+	}
+	DEBUG_HOOK("NtQueryDirectoryFile(handle=%p, [%ls] %s, %i, %i, %i)\n", tmph, buf, ansi, ReturnSingleEntry, RestartScan, FileInformationClass);
+	free(ansi);
+	rc = NtQueryDirectoryFile_orig(tmph,
+					 Event,
+					 ApcRoutine,
+					 ApcContext,
+					 IoStatusBlock,
+					 FileInformation,
+					 Length,
+					 FileInformationClass,
+					 ReturnSingleEntry,
+					 FileName,
+					 RestartScan);
+	if(tmph != FileHandle) {
+		CloseHandle(tmph);
+	}
+	DEBUG_HOOK(" -- query rc: %08x\n", rc);
+	return rc;
+}
+
+
 BOOL WINAPI DeleteFileA_hook(
     __in LPCSTR lpFileName)
 {
-	handle_file(lpFileName, NULL, ACCESS_UNLINK);
-	return DeleteFileA_orig(lpFileName);
+	return tup_unlink(lpFileName);
 }
 
 BOOL WINAPI DeleteFileW_hook(
     __in LPCWSTR lpFileName)
 {
-	handle_file_w(lpFileName, NULL, ACCESS_UNLINK);
-	return DeleteFileW_orig(lpFileName);
+	return tup_unlink_w(lpFileName);
 }
 
 BOOL WINAPI DeleteFileTransactedA_hook(
     __in     LPCSTR lpFileName,
     __in     HANDLE hTransaction)
 {
-	handle_file(lpFileName, NULL, ACCESS_UNLINK);
-	return DeleteFileTransactedA_orig(lpFileName, hTransaction);
+	(void)hTransaction;
+	return tup_unlink(lpFileName);
 }
 
 BOOL WINAPI DeleteFileTransactedW_hook(
     __in     LPCWSTR lpFileName,
     __in     HANDLE hTransaction)
 {
-	handle_file_w(lpFileName, NULL, ACCESS_UNLINK);
-	return DeleteFileTransactedW_orig(lpFileName, hTransaction);
+	(void)hTransaction;
+	return tup_unlink_w(lpFileName);
 }
 
 BOOL WINAPI MoveFileA_hook(
     __in LPCSTR lpExistingFileName,
     __in LPCSTR lpNewFileName)
 {
-	handle_file(lpExistingFileName, lpNewFileName, ACCESS_RENAME);
-	return MoveFileA_orig(lpExistingFileName, lpNewFileName);
+	return tup_rename(lpExistingFileName, lpNewFileName);
 }
 
 BOOL WINAPI MoveFileW_hook(
     __in LPCWSTR lpExistingFileName,
     __in LPCWSTR lpNewFileName)
 {
-	handle_file_w(lpExistingFileName, lpNewFileName, ACCESS_RENAME);
-	return MoveFileW_orig(lpExistingFileName, lpNewFileName);
+	return tup_rename_w(lpExistingFileName, lpNewFileName);
 }
 
 BOOL WINAPI MoveFileExA_hook(
@@ -800,8 +1215,8 @@ BOOL WINAPI MoveFileExA_hook(
     __in_opt LPCSTR lpNewFileName,
     __in     DWORD    dwFlags)
 {
-	handle_file(lpExistingFileName, lpNewFileName, ACCESS_RENAME);
-	return MoveFileExA_orig(lpExistingFileName, lpNewFileName, dwFlags);
+	(void)dwFlags;
+	return tup_rename(lpExistingFileName, lpNewFileName);
 }
 
 BOOL WINAPI MoveFileExW_hook(
@@ -809,8 +1224,8 @@ BOOL WINAPI MoveFileExW_hook(
     __in_opt LPCWSTR lpNewFileName,
     __in     DWORD    dwFlags)
 {
-	handle_file_w(lpExistingFileName, lpNewFileName, ACCESS_RENAME);
-	return MoveFileExW_orig(lpExistingFileName, lpNewFileName, dwFlags);
+	(void)dwFlags;
+	return tup_rename_w(lpExistingFileName, lpNewFileName);
 }
 
 BOOL WINAPI MoveFileWithProgressA_hook(
@@ -820,13 +1235,10 @@ BOOL WINAPI MoveFileWithProgressA_hook(
     __in_opt LPVOID lpData,
     __in     DWORD dwFlags)
 {
-	handle_file(lpExistingFileName, lpNewFileName, ACCESS_RENAME);
-	return MoveFileWithProgressA_orig(
-		lpExistingFileName,
-		lpNewFileName,
-		lpProgressRoutine,
-		lpData,
-		dwFlags);
+	(void)lpProgressRoutine;
+	(void)lpData;
+	(void)dwFlags;
+	return tup_rename(lpExistingFileName, lpNewFileName);
 }
 
 BOOL WINAPI MoveFileWithProgressW_hook(
@@ -836,13 +1248,10 @@ BOOL WINAPI MoveFileWithProgressW_hook(
     __in_opt LPVOID lpData,
     __in     DWORD dwFlags)
 {
-	handle_file_w(lpExistingFileName, lpNewFileName, ACCESS_RENAME);
-	return MoveFileWithProgressW_orig(
-		lpExistingFileName,
-		lpNewFileName,
-		lpProgressRoutine,
-		lpData,
-		dwFlags);
+	(void)lpProgressRoutine;
+	(void)lpData;
+	(void)dwFlags;
+	return tup_rename_w(lpExistingFileName, lpNewFileName);
 }
 
 BOOL WINAPI MoveFileTransactedA_hook(
@@ -853,14 +1262,11 @@ BOOL WINAPI MoveFileTransactedA_hook(
     __in     DWORD dwFlags,
     __in     HANDLE hTransaction)
 {
-	handle_file(lpExistingFileName, lpNewFileName, ACCESS_RENAME);
-	return MoveFileTransactedA_orig(
-		lpExistingFileName,
-		lpNewFileName,
-		lpProgressRoutine,
-		lpData,
-		dwFlags,
-		hTransaction);
+	(void)lpProgressRoutine;
+	(void)lpData;
+	(void)dwFlags;
+	(void)hTransaction;
+	return tup_rename(lpExistingFileName, lpNewFileName);
 }
 
 BOOL WINAPI MoveFileTransactedW_hook(
@@ -871,14 +1277,11 @@ BOOL WINAPI MoveFileTransactedW_hook(
     __in     DWORD dwFlags,
     __in     HANDLE hTransaction)
 {
-	handle_file_w(lpExistingFileName, lpNewFileName, ACCESS_RENAME);
-	return MoveFileTransactedW_orig(
-		lpExistingFileName,
-		lpNewFileName,
-		lpProgressRoutine,
-		lpData,
-		dwFlags,
-		hTransaction);
+	(void)lpProgressRoutine;
+	(void)lpData;
+	(void)dwFlags;
+	(void)hTransaction;
+	return tup_rename_w(lpExistingFileName, lpNewFileName);
 }
 
 BOOL WINAPI ReplaceFileA_hook(
@@ -889,14 +1292,11 @@ BOOL WINAPI ReplaceFileA_hook(
     __reserved LPVOID  lpExclude,
     __reserved LPVOID  lpReserved)
 {
-	handle_file(lpReplacementFileName, lpReplacedFileName, ACCESS_RENAME);
-	return ReplaceFileA_orig(
-		lpReplacedFileName,
-		lpReplacementFileName,
-		lpBackupFileName,
-		dwReplaceFlags,
-		lpExclude,
-		lpReserved);
+	(void)lpBackupFileName;
+	(void)dwReplaceFlags;
+	(void)lpExclude;
+	(void)lpReserved;
+	return tup_rename(lpReplacementFileName, lpReplacedFileName);
 }
 
 BOOL WINAPI ReplaceFileW_hook(
@@ -907,14 +1307,11 @@ BOOL WINAPI ReplaceFileW_hook(
     __reserved LPVOID  lpExclude,
     __reserved LPVOID  lpReserved)
 {
-	handle_file_w(lpReplacementFileName, lpReplacedFileName, ACCESS_RENAME);
-	return ReplaceFileW_orig(
-		lpReplacedFileName,
-		lpReplacementFileName,
-		lpBackupFileName,
-		dwReplaceFlags,
-		lpExclude,
-		lpReserved);
+	(void)lpBackupFileName;
+	(void)dwReplaceFlags;
+	(void)lpExclude;
+	(void)lpReserved;
+	return tup_rename_w(lpReplacementFileName, lpReplacedFileName);
 }
 
 BOOL WINAPI CopyFileA_hook(
@@ -922,11 +1319,12 @@ BOOL WINAPI CopyFileA_hook(
     __in LPCSTR lpNewFileName,
     __in BOOL bFailIfExists)
 {
-	handle_file(lpExistingFileName, NULL, ACCESS_READ);
-	handle_file(lpNewFileName, NULL, ACCESS_WRITE);
+	LPCSTR readFile = tup_get_read(lpExistingFileName);
+	LPCSTR writeFile = tup_get_write(lpNewFileName);
+
 	return CopyFileA_orig(
-		lpExistingFileName,
-		lpNewFileName,
+		readFile,
+		writeFile,
 		bFailIfExists);
 }
 
@@ -935,11 +1333,13 @@ BOOL WINAPI CopyFileW_hook(
     __in LPCWSTR lpNewFileName,
     __in BOOL bFailIfExists)
 {
-	handle_file_w(lpExistingFileName, NULL, ACCESS_READ);
-	handle_file_w(lpNewFileName, NULL, ACCESS_WRITE);
-	return CopyFileW_orig(
-		lpExistingFileName,
-		lpNewFileName,
+	char buf[PATH_MAX];
+	LPCSTR readFile = tup_get_read_w(lpExistingFileName, buf);
+	LPCSTR writeFile = tup_get_write_w(lpNewFileName);
+
+	return CopyFileA_orig(
+		readFile,
+		writeFile,
 		bFailIfExists);
 }
 
@@ -951,11 +1351,12 @@ BOOL WINAPI CopyFileExA_hook(
     __in_opt LPBOOL pbCancel,
     __in     DWORD dwCopyFlags)
 {
-	handle_file(lpExistingFileName, NULL, ACCESS_READ);
-	handle_file(lpNewFileName, NULL, ACCESS_WRITE);
+	LPCSTR readFile = tup_get_read(lpExistingFileName);
+	LPCSTR writeFile = tup_get_write(lpNewFileName);
+
 	return CopyFileExA_orig(
-		lpExistingFileName,
-		lpNewFileName,
+		readFile,
+		writeFile,
 		lpProgressRoutine,
 		lpData,
 		pbCancel,
@@ -970,11 +1371,13 @@ BOOL WINAPI CopyFileExW_hook(
     __in_opt LPBOOL pbCancel,
     __in     DWORD dwCopyFlags)
 {
-	handle_file_w(lpExistingFileName, NULL, ACCESS_READ);
-	handle_file_w(lpNewFileName, NULL, ACCESS_WRITE);
-	return CopyFileExW_orig(
-		lpExistingFileName,
-		lpNewFileName,
+	char buf[PATH_MAX];
+	LPCSTR readFile = tup_get_read_w(lpExistingFileName, buf);
+	LPCSTR writeFile = tup_get_write_w(lpNewFileName);
+
+	return CopyFileExA_orig(
+		readFile,
+		writeFile,
 		lpProgressRoutine,
 		lpData,
 		pbCancel,
@@ -990,11 +1393,12 @@ BOOL WINAPI CopyFileTransactedA_hook(
     __in     DWORD dwCopyFlags,
     __in     HANDLE hTransaction)
 {
-	handle_file(lpExistingFileName, NULL, ACCESS_READ);
-	handle_file(lpNewFileName, NULL, ACCESS_WRITE);
+	LPCSTR readFile = tup_get_read(lpExistingFileName);
+	LPCSTR writeFile = tup_get_write(lpNewFileName);
+
 	return CopyFileTransactedA_orig(
-		lpExistingFileName,
-		lpNewFileName,
+		readFile,
+		writeFile,
 		lpProgressRoutine,
 		lpData,
 		pbCancel,
@@ -1011,11 +1415,13 @@ BOOL WINAPI CopyFileTransactedW_hook(
     __in     DWORD dwCopyFlags,
     __in     HANDLE hTransaction)
 {
-	handle_file_w(lpExistingFileName, NULL, ACCESS_READ);
-	handle_file_w(lpNewFileName, NULL, ACCESS_WRITE);
-	return CopyFileTransactedW_orig(
-		lpExistingFileName,
-		lpNewFileName,
+	char buf[PATH_MAX];
+	LPCSTR readFile = tup_get_read_w(lpExistingFileName, buf);
+	LPCSTR writeFile = tup_get_write_w(lpNewFileName);
+
+	return CopyFileTransactedA_orig(
+		readFile,
+		writeFile,
 		lpProgressRoutine,
 		lpData,
 		pbCancel,
@@ -1027,7 +1433,10 @@ BOOL WINAPI CopyFileTransactedW_hook(
 DWORD WINAPI GetFileAttributesA_hook(
     __in LPCSTR lpFileName)
 {
-	DWORD attributes = GetFileAttributesA_orig(lpFileName);
+	DWORD attributes;
+	LPCSTR readFile = tup_get_read_no_handle(lpFileName);
+
+	attributes = GetFileAttributesA_orig(readFile);
 	DEBUG_HOOK("GetFileAttributesA '%s'\n", lpFileName);
 
 	/* If it fails (attributes == -1), we need to handle the read since
@@ -1042,7 +1451,11 @@ DWORD WINAPI GetFileAttributesA_hook(
 DWORD WINAPI GetFileAttributesW_hook(
     __in LPCWSTR lpFileName)
 {
-	DWORD attributes = GetFileAttributesW_orig(lpFileName);
+	DWORD attributes;
+	char buf[PATH_MAX];
+	LPCSTR readFile = tup_get_read_no_handle_w(lpFileName, buf);
+
+	attributes = GetFileAttributesA_orig(readFile);
 	if(attributes == ATTRIB_FAIL || ! (attributes & FILE_ATTRIBUTE_DIRECTORY))
 		handle_file_w(lpFileName, NULL, ACCESS_READ);
 	return attributes;
@@ -1053,8 +1466,11 @@ BOOL WINAPI GetFileAttributesExA_hook(
     __in  GET_FILEEX_INFO_LEVELS fInfoLevelId,
     __out LPVOID lpFileInformation)
 {
-	DWORD attributes = GetFileAttributesExA_orig(
-		lpFileName,
+	DWORD attributes;
+	LPCSTR readFile = tup_get_read_no_handle(lpFileName);
+
+	attributes = GetFileAttributesExA_orig(
+		readFile,
 		fInfoLevelId,
 		lpFileInformation);
 	if(attributes == ATTRIB_FAIL || ! (attributes & FILE_ATTRIBUTE_DIRECTORY))
@@ -1067,8 +1483,12 @@ BOOL WINAPI GetFileAttributesExW_hook(
     __in  GET_FILEEX_INFO_LEVELS fInfoLevelId,
     __out LPVOID lpFileInformation)
 {
-	DWORD attributes = GetFileAttributesExW_orig(
-		lpFileName,
+	DWORD attributes;
+	char buf[PATH_MAX];
+	LPCSTR readFile = tup_get_read_no_handle_w(lpFileName, buf);
+
+	attributes = GetFileAttributesExA_orig(
+		readFile,
 		fInfoLevelId,
 		lpFileInformation);
 	if(attributes == ATTRIB_FAIL || ! (attributes & FILE_ATTRIBUTE_DIRECTORY))
@@ -1149,7 +1569,7 @@ BOOL WINAPI CreateProcessA_hook(
 
 	/* Ignore mspdbsrv.exe, since it continues to run in the background */
 	if(strcasestr(lpApplicationName, "mspdbsrv.exe") == NULL)
-		tup_inject_dll(lpProcessInformation, s_depfilename);
+		tup_inject_dll(lpProcessInformation, s_depfilename, sid);
 
 	if ((dwCreationFlags & CREATE_SUSPENDED) != 0)
 		return 1;
@@ -1193,7 +1613,7 @@ BOOL WINAPI CreateProcessW_hook(
 
 	/* Ignore mspdbsrv.exe, since it continues to run in the background */
 	if(wcscasestr(lpApplicationName, L"mspdbsrv.exe") == NULL)
-		tup_inject_dll(lpProcessInformation, s_depfilename);
+		tup_inject_dll(lpProcessInformation, s_depfilename, sid);
 
 	if ((dwCreationFlags & CREATE_SUSPENDED) != 0)
 		return 1;
@@ -1238,7 +1658,7 @@ BOOL WINAPI CreateProcessAsUserA_hook(
 
 	/* Ignore mspdbsrv.exe, since it continues to run in the background */
 	if(strcasestr(lpApplicationName, "mspdbsrv.exe") == NULL)
-		tup_inject_dll(lpProcessInformation, s_depfilename);
+		tup_inject_dll(lpProcessInformation, s_depfilename, sid);
 
 	if ((dwCreationFlags & CREATE_SUSPENDED) != 0)
 		return 1;
@@ -1283,7 +1703,7 @@ BOOL WINAPI CreateProcessAsUserW_hook(
 
 	/* Ignore mspdbsrv.exe, since it continues to run in the background */
 	if(wcscasestr(lpApplicationName, L"mspdbsrv.exe") == NULL)
-		tup_inject_dll(lpProcessInformation, s_depfilename);
+		tup_inject_dll(lpProcessInformation, s_depfilename, sid);
 
 	if ((dwCreationFlags & CREATE_SUSPENDED) != 0)
 		return 1;
@@ -1328,7 +1748,7 @@ BOOL WINAPI CreateProcessWithLogonW_hook(
 
 	/* Ignore mspdbsrv.exe, since it continues to run in the background */
 	if(wcscasestr(lpApplicationName, L"mspdbsrv.exe") == NULL)
-		tup_inject_dll(lpProcessInformation, s_depfilename);
+		tup_inject_dll(lpProcessInformation, s_depfilename, sid);
 
 	if ((dwCreationFlags & CREATE_SUSPENDED) != 0)
 		return 1;
@@ -1369,7 +1789,7 @@ BOOL WINAPI CreateProcessWithTokenW_hook(
 
 	/* Ignore mspdbsrv.exe, since it continues to run in the background */
 	if(wcscasestr(lpApplicationName, L"mspdbsrv.exe") == NULL)
-		tup_inject_dll(lpProcessInformation, s_depfilename);
+		tup_inject_dll(lpProcessInformation, s_depfilename, sid);
 
 	if ((dwCreationFlags & CREATE_SUSPENDED) != 0)
 		return 1;
@@ -1379,35 +1799,34 @@ BOOL WINAPI CreateProcessWithTokenW_hook(
 
 int _access_hook(const char *pathname, int mode)
 {
-	handle_file(pathname, NULL, ACCESS_READ);
-	return _access_orig(pathname, mode);
+	LPCSTR realName = tup_get_read(pathname);
+	return _access_orig(realName, mode);
 }
 
 FILE *fopen_hook(const char *path, const char *mode)
 {
+	LPCSTR realName;
 	DEBUG_HOOK("fopen mode = %s\n", mode );
 
-	FILE *ret = fopen_orig(path, mode);
 	if(strchr(mode, 'w') == NULL &&
 	   strchr(mode, 'a') == NULL &&
-	   ( strchr(mode, '+') == NULL || ret == NULL ) ) {
-		handle_file(path, NULL, ACCESS_READ);
+	   strchr(mode, '+') == NULL) {
+		realName = tup_get_read(path);
 	} else {
-		handle_file(path, NULL, ACCESS_WRITE);
+		return fopen_orig(path, mode);
+//		realName = tup_get_write(path);
 	}
-	return ret;
+	return fopen_orig(realName, mode);
 }
 
 int rename_hook(const char *oldpath, const char *newpath)
 {
-	handle_file(oldpath, newpath, ACCESS_RENAME);
-	return rename_orig(oldpath, newpath);
+	return tup_rename(oldpath, newpath);
 }
 
 int remove_hook(const char *pathname)
 {
-	handle_file(pathname, NULL, ACCESS_UNLINK);
-	return remove_orig(pathname);
+	return tup_unlink(pathname);
 }
 
 /* -------------------------------------------------------------------------- */
@@ -1416,13 +1835,14 @@ int remove_hook(const char *pathname)
 typedef HMODULE (WINAPI *LoadLibraryA_t)(const char*);
 typedef FARPROC (WINAPI *GetProcAddress_t)(HMODULE, const char*);
 
-struct remote_thread_t
-{
+struct remote_thread_t {
 	LoadLibraryA_t load_library;
 	GetProcAddress_t get_proc_address;
+	int sid;
 	char depfilename[MAX_PATH];
 	char execdir[MAX_PATH];
 	char dll_name[MAX_PATH];
+	char tmpdir[MAX_PATH];
 	char func_name[256];
 };
 
@@ -1514,10 +1934,12 @@ static void hook(HMODULE h, IMAGE_THUNK_DATA* orig, IMAGE_THUNK_DATA* cur, void*
 static void have_kernel32_import(HMODULE h, IMAGE_THUNK_DATA* orig, IMAGE_THUNK_DATA* cur)
 {
 	HOOK(OpenFile);
+#if 0
 	HOOK(CreateFileA);
 	HOOK(CreateFileW);
 	HOOK(CreateFileTransactedA);
 	HOOK(CreateFileTransactedW);
+#endif
 	HOOK(DeleteFileA);
 	HOOK(DeleteFileW);
 	HOOK(DeleteFileTransactedA);
@@ -1560,8 +1982,10 @@ static void have_advapi32_import(HMODULE h, IMAGE_THUNK_DATA* orig, IMAGE_THUNK_
 
 static void have_nt_import(HMODULE h, IMAGE_THUNK_DATA* orig, IMAGE_THUNK_DATA* cur)
 {
+	if(h || orig || cur) {}
 	HOOK(NtCreateFile);
 	HOOK(NtOpenFile);
+	HOOK(NtQueryDirectoryFile);
 }
 
 static void have_msvcrt_import(HMODULE h, IMAGE_THUNK_DATA* orig, IMAGE_THUNK_DATA* cur)
@@ -1574,13 +1998,15 @@ static void have_msvcrt_import(HMODULE h, IMAGE_THUNK_DATA* orig, IMAGE_THUNK_DA
 
 /* -------------------------------------------------------------------------- */
 
-static char execdir[MAX_PATH];
-
-void tup_inject_setexecdir(const char* dir)
+void tup_inject_setexecdir(const char* dir, const char *newtmpdir)
 {
 	execdir[0] = '\0';
 	strncat(execdir, dir, MAX_PATH);
 	execdir[MAX_PATH - 1] = '\0';
+
+	tmpdir[0] = '\0';
+	strncat(tmpdir, newtmpdir, MAX_PATH);
+	tmpdir[MAX_PATH - 1] = '\0';
 }
 
 /* -------------------------------------------------------------------------- */
@@ -1677,7 +2103,7 @@ static int ignore_file_w(const wchar_t* file)
 
 static int canon_path(const char *file, char *dest)
 {
-	if(!file)
+	if(!file || !file[0])
 		return 0;
 	if(is_full_path(file)) {
 		/* Full path */
@@ -1715,7 +2141,7 @@ static void mhandle_file(const char* file, const char* file2, enum access_type a
 	int ret;
 	if(line) {}
 
-	if (ignore_file(file) || ignore_file(file2) || deph == INVALID_HANDLE_VALUE)
+	if (ignore_file(file) || ignore_file(file2) || depf == NULL)
 		goto exit;
 
 	e->at = at;
@@ -1739,7 +2165,7 @@ exit:;
 	SetLastError( save_error );
 }
 
-static void handle_file_w(const wchar_t* file, const wchar_t* file2, enum access_type at)
+static void mhandle_file_w(const wchar_t* file, const wchar_t* file2, enum access_type at, int line)
 {
 	DWORD save_error = GetLastError();
 
@@ -1752,8 +2178,9 @@ static void handle_file_w(const wchar_t* file, const wchar_t* file2, enum access
 	char* dest = (char*) (e + 1);
 	int ret;
 	int count;
+	if(line) {}
 
-	if (ignore_file_w(file) || ignore_file_w(file2) || deph == INVALID_HANDLE_VALUE)
+	if (ignore_file_w(file) || ignore_file_w(file2) || depf == NULL)
 		goto exit;
 
 	e->at = at;
@@ -1771,7 +2198,7 @@ static void handle_file_w(const wchar_t* file, const wchar_t* file2, enum access
 	dest += e->len2;
 	*(dest++) = '\0';
 
-	DEBUG_HOOK("%s [wide, %i, %i]: '%S', '%S'\n", access_type_name[at], e->len, e->len2, file, file2);
+	DEBUG_HOOK("%s line=%i [wide, %i, %i]: '%S', '%S'\n", access_type_name[at], line, e->len, e->len2, file, file2);
 	ret = writef((char*) e, dest - (char*) e);
 	DEBUG_HOOK("writef [wide] %d\n", ret);
 	if(ret) {}
@@ -1782,11 +2209,17 @@ exit:;
 
 static int open_file(const char *depfilename)
 {
-	deph = CreateFile(depfilename, FILE_APPEND_DATA, FILE_SHARE_WRITE, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_TEMPORARY, NULL);
-	if(deph == INVALID_HANDLE_VALUE) {
+	depf = fopen(depfilename, "rb+");
+	if(!depf) {
 		perror(depfilename);
 		return -1;
 	}
+
+/*	deph = CreateFile(depfilename, GENERIC_READ | GENERIC_WRITE, FILE_SHARE_WRITE | FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_TEMPORARY, NULL);
+	if(deph == INVALID_HANDLE_VALUE) {
+		perror(depfilename);
+		return -1;
+	}*/
 	return 0;
 }
 
@@ -1794,9 +2227,9 @@ static int open_file(const char *depfilename)
 
 BOOL WINAPI DllMain(HANDLE HDllHandle, DWORD Reason, LPVOID Reserved)
 {
-	(void) HDllHandle;
-	(void) Reason;
-	(void) Reserved;
+	(void)HDllHandle;
+	(void)Reason;
+	(void)Reserved;
 	return 1;
 }
 
@@ -1842,12 +2275,14 @@ DWORD tup_inject_init(remote_thread_t* r)
 
 	modnum /= sizeof(HMODULE);
 
-	tup_inject_setexecdir(r->execdir);
+	tup_inject_setexecdir(r->execdir, r->tmpdir);
 
 	if (open_file(r->depfilename))
 		return 1;
 
 	strcpy(s_depfilename, r->depfilename);
+
+	sid = r->sid;
 
 	handle_file(filename, NULL, ACCESS_READ);
 
@@ -1899,7 +2334,8 @@ static void remote_end(void)
 
 int tup_inject_dll(
 	LPPROCESS_INFORMATION lpProcessInformation,
-	const char *depfilename)
+	const char *depfilename,
+	int newsid)
 {
 	remote_thread_t remote;
 	char* remote_data;
@@ -1918,6 +2354,8 @@ int tup_inject_dll(
 	strcat(remote.dll_name, "\\");
 	strcat(remote.dll_name, "tup-dllinject.dll");
 	strcat(remote.func_name, "tup_inject_init");
+	strcat(remote.tmpdir, tmpdir);
+	remote.sid = newsid;
 
 	CONTEXT ctx;
 	ctx.ContextFlags = CONTEXT_CONTROL;

@@ -141,7 +141,9 @@ int handle_open_file(enum access_type at, const char *filename,
 			break;
 		case ACCESS_WRITE:
 		case ACCESS_UNLINK:
-		case ACCESS_RENAME:
+			/* These are only used for the Windows server, and are
+			 * otherwise invalid.
+			 */
 		default:
 			fprintf(stderr, "Invalid event type: %i\n", at);
 			rc = -1;

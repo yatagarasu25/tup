@@ -20,6 +20,7 @@
  */
 
 #include "tup/server.h"
+#include "tup/mapping.h"
 #include "tup/config.h"
 #include "tup/flist.h"
 #include "tup/environ.h"
@@ -54,7 +55,9 @@ int server_post_exit(void)
 int server_init(enum server_mode mode)
 {
 	char *slash;
-	char mycwd[PATH_MAX];
+	char tupexecdir[PATH_MAX];
+	char cwd[PATH_MAX];
+	char tmpdir[PATH_MAX];
 	struct flist f = {0, 0, 0};
 	int cwdlen;
 
@@ -63,16 +66,14 @@ int server_init(enum server_mode mode)
 	if(server_inited)
 		return 0;
 
-	if (GetModuleFileNameA(NULL, mycwd, PATH_MAX - 1) == 0)
+	if (GetModuleFileNameA(NULL, tupexecdir, PATH_MAX - 1) == 0)
 		return -1;
 
-	mycwd[PATH_MAX - 1] = '\0';
-	slash = strrchr(mycwd, '\\');
+	tupexecdir[PATH_MAX - 1] = '\0';
+	slash = strrchr(tupexecdir, '\\');
 	if (slash) {
 		*slash = '\0';
 	}
-
-	tup_inject_setexecdir(mycwd);
 
 	if(fchdir(tup_top_fd()) < 0) {
 		perror("fchdir");
@@ -91,11 +92,6 @@ int server_init(enum server_mode mode)
 	}
 	tuptmpdir[cwdlen] = '\\';
 	memcpy(tuptmpdir + cwdlen + 1, ".tup\\tmp", sizeof(TUP_TMP));
-
-	if(fchdir(tup_top_fd()) < 0) {
-		perror("fchdir");
-		return -1;
-	}
 	if(mkdir(TUP_TMP) < 0) {
 		if(errno != EEXIST) {
 			perror(TUP_TMP);
@@ -132,7 +128,10 @@ int server_init(enum server_mode mode)
 		return -1;
 	}
 
+	snprintf(tmpdir, sizeof(tmpdir), "%s\\.tup\\tmp", getcwd(cwd, sizeof(cwd)));
+	tup_inject_setexecdir(tupexecdir, tmpdir);
 	server_inited = 1;
+
 	return 0;
 }
 
@@ -278,7 +277,7 @@ int server_exec(struct server *s, int dfd, const char *cmd, struct tup_env *newe
 	}
 	pthread_mutex_unlock(&dir_mutex);
 
-	if(tup_inject_dll(&pi, depfile)) {
+	if(tup_inject_dll(&pi, depfile, s->id)) {
 		pthread_mutex_lock(s->error_mutex);
 		fprintf(stderr, "tup error: failed to inject dll: %s\n", strerror(errno));
 		pthread_mutex_unlock(s->error_mutex);
@@ -476,34 +475,44 @@ static int process_depfile(struct server *s, const char *depfile)
 			return -1;
 		}
 
+		/* We duplicate writes here because the mapping tree in
+		 * dllinject is needed in the process space to handle mappings,
+		 * and also for us because we need to move them over at the end.
+		 * Contrast with the fuse server which already has the mappings
+		 * locally.
+		 */
 		if(event.at == ACCESS_WRITE) {
+			printf("Got write event[%i, %i]: '%s', '%s'\n", event.len, event.len2, event1, event2);
+			if(!add_mapping(event1, event2, &s->finfo.mapping_root)) {
+				fprintf(stderr, "tup error: Unable to insert mapping for file '%s'\n", event1);
+				return -1;
+			}
+		} else if(event.at == ACCESS_UNLINK) {
 			struct mapping *map;
-
-			map = malloc(sizeof *map);
+			char *filename;
+			map = get_mapping(event1, &s->finfo.mapping_root);
 			if(!map) {
-				perror("malloc");
+				fprintf(stderr, "tup error: Got an ACCESS_UNLINK event without a corresponding file mapping for file '%s'\n", event1);
 				return -1;
 			}
-			map->realname.s = strdup(event1);
-			if(!map->realname.s) {
-				perror("strdup");
+			filename = map->tmpname;
+			filename = strstr(map->tmpname, ".tup\\tmp");
+			if(!filename) {
+				fprintf(stderr, "tup error: Expected to find '.tup\\tmp' in the temporary filename for file: %s\n", map->tmpname);
 				return -1;
 			}
-			map->realname.len = strlen(map->realname.s);
-			map->tmpname = strdup(event1);
-			if(!map->tmpname) {
-				perror("strdup");
+			if(unlink(filename) < 0) {
+				perror(filename);
+				fprintf(stderr, "tup error: Unable to unlink temporary output file.\n");
 				return -1;
 			}
-			map->tent = NULL; /* This is used when saving deps */
-			if(string_tree_insert(&s->finfo.mapping_root, &map->realname) < 0) {
-				fprintf(stderr, "tup error: Unable to add map entry for '%s'\n", map->realname.s);
+			printf("UNLINK: %s\n", map->tmpname);
+			del_mapping(map, &s->finfo.mapping_root);
+		} else {
+			if(handle_file(event.at, event1, &s->finfo) < 0) {
+				fprintf(stderr, "Error: Failed to call handle_file on event '%s'\n", event1);
 				return -1;
 			}
-		}
-		if(handle_file(event.at, event1, &s->finfo) < 0) {
-			fprintf(stderr, "tup error: Failed to call handle_file on event '%s'\n", event1);
-			return -1;
 		}
 	}
 	if(fclose(f) < 0) {

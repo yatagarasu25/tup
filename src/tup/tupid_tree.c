@@ -19,8 +19,8 @@
  */
 
 #include "tupid_tree.h"
-#include "db.h"
 #include "container.h"
+#include <stdio.h>
 #include <stdlib.h>
 
 static int tupid_tree_cmp(struct tupid_tree *tt1, struct tupid_tree *tt2)
@@ -58,7 +58,6 @@ int tupid_tree_add(struct tupid_entries *root, tupid_t tupid)
 	tt->tupid = tupid;
 	if(tupid_tree_insert(root, tt) < 0) {
 		fprintf(stderr, "tup error: Unable to insert duplicate tupid %lli\n", tupid);
-		tup_db_print(stderr, tupid);
 		return -1;
 	}
 	return 0;

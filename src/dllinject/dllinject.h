@@ -38,9 +38,9 @@ DLLINJECT_API BOOL WINAPI DllMain(HANDLE HDllHandle, DWORD Reason, LPVOID Reserv
 typedef struct remote_thread_t remote_thread_t;
 DLLINJECT_API DWORD tup_inject_init(remote_thread_t *r);
 
-DLLINJECT_API void tup_inject_setexecdir(const char *dir);
+DLLINJECT_API void tup_inject_setexecdir(const char *dir, const char *tmpdir);
 
-DLLINJECT_API int tup_inject_dll(LPPROCESS_INFORMATION process, const char *depfilename);
+DLLINJECT_API int tup_inject_dll(LPPROCESS_INFORMATION process, const char *depfilename, int sid);
 
 #ifdef __cplusplus
 }
