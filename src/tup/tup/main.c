@@ -2,7 +2,7 @@
  *
  * tup - A file-based build system
  *
- * Copyright (C) 2008-2012  Mike Shal <marfey@gmail.com>
+ * Copyright (C) 2008-2013  Mike Shal <marfey@gmail.com>
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 2 as
@@ -48,7 +48,7 @@
 #endif
 
 static int init(int argc, char **argv);
-static int graph_cb(void *arg, struct tup_entry *tent, int style);
+static int graph_cb(void *arg, struct tup_entry *tent);
 static int graph(int argc, char **argv);
 /* Testing commands */
 static int mlink(int argc, char **argv);
@@ -66,7 +66,6 @@ static int fake_parser_version(int argc, char **argv);
 static int waitmon(void);
 static int flush(void);
 static int ghost_check(void);
-static void print_name(const char *s, char c);
 
 static void version(void);
 static void usage(void);
@@ -192,6 +191,9 @@ int main(int argc, char **argv)
 		rc = updater(argc, argv, 2);
 	} else if(strcmp(cmd, "upd") == 0) {
 		rc = updater(argc, argv, 0);
+	} else if(strcmp(cmd, "refactor") == 0 ||
+		  strcmp(cmd, "ref") == 0) {
+		rc = updater(argc, argv, -2);
 	} else if(strcmp(cmd, "autoupdate") == 0) {
 		rc = updater(argc, argv, 0);
 		clear_autoupdate = 1;
@@ -204,8 +206,14 @@ int main(int argc, char **argv)
 		rc = variant(argc, argv);
 	} else if(strcmp(cmd, "node_exists") == 0) {
 		rc = node_exists(argc, argv);
-	} else if(strcmp(cmd, "link_exists") == 0) {
+	} else if(strcmp(cmd, "normal_exists") == 0 ||
+		  strcmp(cmd, "sticky_exists") == 0) {
 		rc = link_exists(argc, argv);
+		/* Since an error code of <0 gets converted to 1, we have to
+		 * make 1 (meaning the link exists) something else.
+		 */
+		if(rc == 1)
+			rc = 11;
 	} else if(strcmp(cmd, "flags_exists") == 0) {
 		rc = tup_db_check_flags(TUP_FLAGS_CONFIG | TUP_FLAGS_CREATE | TUP_FLAGS_MODIFY);
 	} else if(strcmp(cmd, "create_flags_exists") == 0) {
@@ -253,7 +261,49 @@ int main(int argc, char **argv)
 	if(tup_cleanup() < 0)
 		rc = 1;
 	tup_valgrind_cleanup();
+	if(rc < 0)
+		return 1;
 	return rc;
+}
+
+static int mkdirtree(const char *dirname)
+{
+	char *dirpart = strdup(dirname);
+	char *p;
+
+	if(!dirpart) {
+		perror("strdup");
+		return -1;
+	}
+
+	p = dirpart;
+	while(1) {
+		char *slash = p;
+		char slash_found = 0;
+
+		while(*slash && !is_path_sep(slash)) {
+			slash++;
+		}
+		if(*slash) {
+			slash_found = *slash;
+			*slash = 0;
+		}
+		if(mkdir(dirpart, 0777) < 0) {
+			if(errno != EEXIST) {
+				perror(dirpart);
+				fprintf(stderr, "tup error: Unable to create directory '%s' for a tup repository.\n", dirname);
+				return -1;
+			}
+		}
+		if(slash_found) {
+			*slash = slash_found;
+			p = slash + 1;
+		} else {
+			break;
+		}
+	}
+	free(dirpart);
+	return 0;
 }
 
 static int init(int argc, char **argv)
@@ -262,19 +312,33 @@ static int init(int argc, char **argv)
 	int db_sync = 1;
 	int force_init = 0;
 	int fd;
+	const char *dirname = NULL;
 
-	for(x=0; x<argc; x++) {
+	for(x=1; x<argc; x++) {
 		if(strcmp(argv[x], "--no-sync") == 0) {
 			db_sync = 0;
 		} else if(strcmp(argv[x], "--force") == 0) {
 			/* force should only be used for tup/test */
 			force_init = 1;
+		} else {
+			if(dirname) {
+				fprintf(stderr, "tup error: Expected only one directory name for 'tup init', but got '%s' and '%s'\n", dirname, argv[x]);
+				return -1;
+			}
+			dirname = argv[x];
 		}
 	}
 
-	fd = open(".", O_RDONLY);
+	if(dirname) {
+		if(mkdirtree(dirname) < 0)
+			return -1;
+	} else {
+		dirname = ".";
+	}
+
+	fd = open(dirname, O_RDONLY);
 	if(fd < 0) {
-		perror(".");
+		perror(dirname);
 		return -1;
 	}
 
@@ -335,7 +399,7 @@ err_close:
 	return -1;
 }
 
-static int graph_cb(void *arg, struct tup_entry *tent, int style)
+static int graph_cb(void *arg, struct tup_entry *tent)
 {
 	struct graph *g = arg;
 	struct node *n;
@@ -348,13 +412,13 @@ static int graph_cb(void *arg, struct tup_entry *tent, int style)
 		return -1;
 
 edge_create:
-	if(style & TUP_LINK_NORMAL && n->expanded == 0) {
+	if(n->expanded == 0) {
 		n->expanded = 1;
 		TAILQ_REMOVE(&g->node_list, n, list);
 		TAILQ_INSERT_HEAD(&g->plist, n, list);
 	}
 	if(g->cur)
-		if(create_edge(g->cur, n, style) < 0)
+		if(create_edge(g->cur, n, TUP_LINK_NORMAL) < 0)
 			return -1;
 	return 0;
 }
@@ -438,112 +502,11 @@ static int graph(int argc, char **argv)
 				return -1;
 	}
 
-	printf("digraph G {\n");
-	TAILQ_FOREACH(n, &g.node_list, list) {
-		int color;
-		int fontcolor;
-		const char *shape;
-		const char *style;
-		char *s;
-		struct edge *e;
-		int flags;
+	if(add_graph_stickies(&g) < 0)
+		return -1;
 
-		if(n == g.root)
-			continue;
+	dump_graph(&g, stdout, show_dirs, show_env, show_ghosts);
 
-		if(!show_env) {
-			if(n->tent->tnode.tupid == env_dt() ||
-			   n->tent->dt == env_dt())
-				continue;
-		}
-
-		style = "solid";
-		color = 0;
-		fontcolor = 0;
-		switch(n->tent->type) {
-			case TUP_NODE_FILE:
-			case TUP_NODE_GENERATED:
-				/* Skip Tupfiles in no-dirs mode since they
-				 * point to directories.
-				 */
-				if(!show_dirs && strcmp(n->tent->name.s, "Tupfile") == 0)
-					continue;
-				shape = "oval";
-				break;
-			case TUP_NODE_CMD:
-				shape = "rectangle";
-				break;
-			case TUP_NODE_DIR:
-				if(!show_dirs)
-					continue;
-				shape = "diamond";
-				break;
-			case TUP_NODE_VAR:
-				shape = "octagon";
-				break;
-			case TUP_NODE_GHOST:
-				if(!show_ghosts)
-					continue;
-				/* Ghost nodes won't have flags set */
-				color = 0x888888;
-				fontcolor = 0x888888;
-				style = "dotted";
-				shape = "oval";
-				break;
-			case TUP_NODE_GROUP:
-				shape = "hexagon";
-				break;
-			case TUP_NODE_ROOT:
-			default:
-				shape="ellipse";
-		}
-
-		flags = tup_db_get_node_flags(n->tnode.tupid);
-		if(flags & TUP_FLAGS_MODIFY) {
-			color |= 0x0000ff;
-			style = "dashed";
-		}
-		if(flags & TUP_FLAGS_CREATE) {
-			color |= 0x00ff00;
-			style = "dashed peripheries=2";
-		}
-		if(n->expanded == 0) {
-			if(color == 0) {
-				color = 0x888888;
-				fontcolor = 0x888888;
-			} else {
-				/* Might only be graphing a subset. Ie:
-				 * graph node foo, which points to command bar,
-				 * and command bar is in the modify list. In
-				 * this case, bar won't be expanded.
-				 */
-			}
-		}
-		printf("\tnode_%lli [label=\"", n->tnode.tupid);
-		s = n->tent->name.s;
-		if(s[0] == '^') {
-			s++;
-			while(*s && *s != ' ') {
-				/* Skip flags (Currently there are none) */
-				s++;
-			}
-			print_name(s, '^');
-		} else {
-			print_name(s, 0);
-		}
-		printf("\\n%lli\" shape=\"%s\" color=\"#%06x\" fontcolor=\"#%06x\" style=%s];\n", n->tnode.tupid, shape, color, fontcolor, style);
-		if(show_dirs && n->tent->dt) {
-			struct node *tmp;
-			tmp = find_node(&g, n->tent->dt);
-			if(tmp)
-				printf("\tnode_%lli -> node_%lli [dir=back color=\"#888888\" arrowtail=odot]\n", n->tnode.tupid, n->tent->dt);
-		}
-
-		LIST_FOREACH(e, &n->edges, list) {
-			printf("\tnode_%lli -> node_%lli [dir=back,style=\"%s\",arrowtail=\"%s\"]\n", e->dest->tnode.tupid, n->tnode.tupid, (e->style == TUP_LINK_STICKY) ? "dotted" : "solid", (e->style & TUP_LINK_STICKY) ? "normal" : "empty");
-		}
-	}
-	printf("}\n");
 	destroy_graph(&g);
 	if(tup_db_commit() < 0)
 		return -1;
@@ -771,12 +734,21 @@ static int link_exists(int argc, char **argv)
 	struct tup_entry *tenta;
 	struct tup_entry *tentb;
 	int exists;
+	int style;
 	tupid_t dta, dtb;
 
 	if(tup_db_begin() < 0)
 		return -1;
 	if(argc != 5) {
-		fprintf(stderr, "tup error: link_exists requires two dir/name pairs.\n");
+		fprintf(stderr, "tup error: %s requires two dir/name pairs.\n", argv[0]);
+		return -1;
+	}
+	if(strcmp(argv[0], "normal_exists") == 0) {
+		style = TUP_LINK_NORMAL;
+	} else if(strcmp(argv[0], "sticky_exists") == 0) {
+		style = TUP_LINK_STICKY;
+	} else {
+		fprintf(stderr, "[31mError: link_exists called with unknown style: %s\n", argv[0]);
 		return -1;
 	}
 	dta = find_dir_tupid(argv[1]);
@@ -804,7 +776,7 @@ static int link_exists(int argc, char **argv)
 		fprintf(stderr, "[31mError: node '%s' doesn't exist.[0m\n", argv[4]);
 		return -1;
 	}
-	if(tup_db_link_exists(tenta->tnode.tupid, tentb->tnode.tupid, &exists) < 0)
+	if(tup_db_link_exists(tenta->tnode.tupid, tentb->tnode.tupid, style, &exists) < 0)
 		return -1;
 	if(tup_db_commit() < 0)
 		return -1;
@@ -1109,19 +1081,6 @@ static int ghost_check(void)
 	if(tup_db_commit() < 0)
 		return -1;
 	return 0;
-}
-
-static void print_name(const char *s, char c)
-{
-	for(; *s && *s != c; s++) {
-		if(*s == '"') {
-			printf("\\\"");
-		} else if(*s == '\\') {
-			printf("\\\\");
-		} else {
-			printf("%c", *s);
-		}
-	}
 }
 
 static void version(void)

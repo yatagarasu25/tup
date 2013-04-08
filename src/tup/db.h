@@ -2,7 +2,7 @@
  *
  * tup - A file-based build system
  *
- * Copyright (C) 2008-2012  Mike Shal <marfey@gmail.com>
+ * Copyright (C) 2008-2013  Mike Shal <marfey@gmail.com>
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 2 as
@@ -34,6 +34,7 @@ struct tup_entry;
 struct tup_entry_head;
 struct tup_env;
 struct variant;
+struct mapping_head;
 
 /* General operations */
 int tup_db_open(void);
@@ -41,6 +42,7 @@ int tup_db_close(void);
 int tup_db_create(int db_sync);
 int tup_db_begin(void);
 int tup_db_commit(void);
+int tup_db_changes(void);
 int tup_db_rollback(void);
 int tup_db_check_flags(int flags);
 void tup_db_enable_sql_debug(void);
@@ -61,14 +63,14 @@ int tup_db_fill_tup_entry(tupid_t tupid, struct tup_entry *tent);
 int tup_db_select_tent(tupid_t dt, const char *name, struct tup_entry **entry);
 int tup_db_select_tent_part(tupid_t dt, const char *name, int len,
 			    struct tup_entry **entry);
-int tup_db_select_node_by_flags(int (*callback)(void *, struct tup_entry *,
-						int style),
+int tup_db_select_node_by_flags(int (*callback)(void *, struct tup_entry *),
 				void *arg, int flags);
-int tup_db_select_node_dir(int (*callback)(void *, struct tup_entry *, int style),
+int tup_db_select_node_dir(int (*callback)(void *, struct tup_entry *),
 			   void *arg, tupid_t dt);
 int tup_db_select_node_dir_glob(int (*callback)(void *, struct tup_entry *),
 				void *arg, tupid_t dt, const char *glob,
-				int len, struct tupid_entries *delete_root);
+				int len, struct tupid_entries *delete_root,
+				int include_directories);
 int tup_db_delete_node(tupid_t tupid);
 int tup_db_delete_dir(tupid_t dt, int force);
 int tup_db_delete_variant(struct tup_entry *tent, void *arg, int (*callback)(void *, struct tup_entry *));
@@ -110,17 +112,25 @@ int tup_db_unflag_variant(tupid_t tupid);
 int tup_db_create_link(tupid_t a, tupid_t b, int style);
 int tup_db_create_unique_link(FILE *f, tupid_t a, tupid_t b, struct tupid_entries *delroot,
 			      struct tupid_entries *root);
-int tup_db_link_exists(tupid_t a, tupid_t b, int *exists);
-int tup_db_link_style(tupid_t a, tupid_t b, int *style);
+int tup_db_link_exists(tupid_t a, tupid_t b, int style,
+		       int *exists);
 int tup_db_get_incoming_link(tupid_t tupid, tupid_t *incoming);
 int tup_db_delete_links(tupid_t tupid);
-int tup_db_write_outputs(tupid_t cmdid, struct tupid_entries *root, struct tup_entry *group);
-int tup_db_write_inputs(tupid_t cmdid, struct tupid_entries *input_root,
+int tup_db_write_outputs(FILE *f, tupid_t cmdid, struct tupid_entries *root,
+			 struct tup_entry *group,
+			 struct tup_entry **old_group,
+			 int refactoring);
+int tup_db_write_inputs(FILE *f, tupid_t cmdid, struct tupid_entries *input_root,
 			struct tupid_entries *env_root,
-			struct tupid_entries *delete_root);
-int tup_db_write_dir_inputs(tupid_t dt, struct tupid_entries *root);
-int tup_db_get_links(tupid_t cmdid, struct tupid_entries *sticky_root,
-		     struct tupid_entries *normal_root);
+			struct tupid_entries *delete_root,
+			struct tup_entry *group,
+			struct tup_entry *old_group,
+			int refactoring);
+int tup_db_write_dir_inputs(FILE *f, tupid_t dt, struct tupid_entries *root,
+			    int refactoring);
+int tup_db_get_inputs(tupid_t cmdid, struct tupid_entries *sticky_root,
+		      struct tupid_entries *normal_root);
+int tup_db_get_outputs(tupid_t cmdid, struct tupid_entries *output_root, struct tup_entry **group);
 
 /* Combo operations */
 int tup_db_modify_cmds_by_output(tupid_t output, int *modified);
@@ -128,9 +138,10 @@ int tup_db_modify_cmds_by_input(tupid_t input);
 int tup_db_set_dependent_flags(tupid_t tupid);
 int tup_db_set_dependent_dir_flags(tupid_t tupid);
 int tup_db_set_dependent_config_flags(tupid_t tupid);
-int tup_db_select_node_by_link(int (*callback)(void *, struct tup_entry *,
-					       int style),
+int tup_db_select_node_by_link(int (*callback)(void *, struct tup_entry *),
 			       void *arg, tupid_t tupid);
+int tup_db_select_node_by_group_link(int (*callback)(void *, struct tup_entry *, struct tup_entry *),
+				     void *arg, tupid_t tupid);
 
 /* Config operations */
 int tup_db_show_config(void);
@@ -165,7 +176,9 @@ int tup_db_scan_end(void);
 
 /* updater operations */
 int tup_db_check_actual_outputs(FILE *f, tupid_t cmdid,
-				struct tup_entry_head *writehead);
+				struct tup_entry_head *writehead,
+				struct mapping_head *mapping_list,
+				int *write_bork);
 int tup_db_check_actual_inputs(FILE *f, tupid_t cmdid,
 			       struct tup_entry_head *readhead,
 			       struct tupid_entries *sticky_root,

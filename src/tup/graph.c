@@ -2,7 +2,7 @@
  *
  * tup - A file-based build system
  *
- * Copyright (C) 2008-2012  Mike Shal <marfey@gmail.com>
+ * Copyright (C) 2008-2013  Mike Shal <marfey@gmail.com>
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 2 as
@@ -29,6 +29,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+static struct graph group_graph;
+static int group_graph_inited = 0;
 
 static struct tup_entry root_entry;
 static char root_name[] = "root";
@@ -144,6 +147,10 @@ int create_graph(struct graph *g, enum TUP_NODE_TYPE count_flags)
 	g->num_nodes = 0;
 	g->count_flags = count_flags;
 	g->total_mtime = 0;
+	if(count_flags == TUP_NODE_GROUP)
+		g->style = TUP_LINK_GROUP;
+	else
+		g->style = TUP_LINK_NORMAL;
 	return 0;
 }
 
@@ -158,18 +165,24 @@ int destroy_graph(struct graph *g)
 	return 0;
 }
 
-int graph_empty(struct graph *g)
+void save_graphs(struct graph *g)
 {
-	if(g->node_list.tqh_last == &TAILQ_NEXT(g->root, list))
-		return 1;
-	return 0;
+	save_graph(stderr, g, ".tup/tmp/graph-full-%i.dot");
+	trim_graph(g);
+	save_graph(stderr, g, ".tup/tmp/graph-trimmed-%i.dot");
 }
 
-static int add_file_cb(void *arg, struct tup_entry *tent, int style)
+static void expand_node(struct graph *g, struct node *n)
+{
+	n->expanded = 1;
+	TAILQ_REMOVE(&g->node_list, n, list);
+	TAILQ_INSERT_HEAD(&g->plist, n, list);
+}
+
+int build_graph_cb(void *arg, struct tup_entry *tent)
 {
 	struct graph *g = arg;
 	struct node *n;
-	int strongly_connected;
 
 	n = find_node(g, tent->tnode.tupid);
 	if(n != NULL)
@@ -186,80 +199,139 @@ edge_create:
 		fprintf(stderr, "tup error: Circular dependency detected! "
 			"Last edge was: %lli -> %lli\n",
 			g->cur->tnode.tupid, tent->tnode.tupid);
+		save_graphs(g);
 		return -1;
 	}
-	strongly_connected = 0;
-	/* Commands are always strongly connected to their outputs, since we
-	 * restrict commands to make sure that they always write all of their
-	 * outputs.
-	 */
-	if(g->cur->tent->type == TUP_NODE_CMD) {
-		strongly_connected = 1;
-	} else {
-		if(style == (TUP_LINK_NORMAL | TUP_LINK_STICKY))
-			strongly_connected = 1;
-	}
-	if(strongly_connected && n->expanded == 0) {
-		if(n->tent->type == g->count_flags)
+	if(n->expanded == 0) {
+		/* TUP_NODE_ROOT means we count everything */
+		if(n->tent->type == g->count_flags || g->count_flags == TUP_NODE_ROOT) {
 			g->num_nodes++;
-		n->expanded = 1;
-		TAILQ_REMOVE(&g->node_list, n, list);
-		TAILQ_INSERT_HEAD(&g->plist, n, list);
+			if(g->total_mtime != -1) {
+				if(n->tent->mtime == -1)
+					g->total_mtime = -1;
+				else
+					g->total_mtime += n->tent->mtime;
+			}
+		}
+		expand_node(g, n);
 	}
 
-	if(create_edge(g->cur, n, style) < 0)
+	if(create_edge(g->cur, n, TUP_LINK_NORMAL) < 0)
 		return -1;
 	return 0;
 }
 
-int nodes_are_connected(struct tup_entry *src, struct tupid_entries *valid_root,
-			int *connected)
+static struct node *find_or_create_node(struct graph *g, struct tup_entry *tent)
 {
-	struct graph g;
+	struct node *n;
+	n = find_node(g, tent->tnode.tupid);
+	if(n)
+		return n;
+	n = create_node(g, tent);
+	if(!n) {
+		fprintf(stderr, "tup error: Can't create node for tup_entry: ");
+		print_tup_entry(stderr, tent);
+		fprintf(stderr, "\n");
+		return NULL;
+	}
+	return n;
+}
+
+static int build_group_cb(void *arg, struct tup_entry *tent,
+			  struct tup_entry *cmdtent)
+{
+	struct graph *g = arg;
+	struct node *cmdn;
 	struct node *n;
 
-	if(create_graph(&g, TUP_NODE_CMD) < 0)
-		return -1;
-	n = create_node(&g, src);
+	n = find_or_create_node(g, tent);
 	if(!n)
 		return -1;
-	if(create_edge(g.cur, n, TUP_LINK_NORMAL) < 0)
+
+	cmdn = find_or_create_node(g, cmdtent);
+	if(!cmdn)
 		return -1;
-	n->expanded = 1;
-	TAILQ_REMOVE(&g.node_list, n, list);
-	TAILQ_INSERT_HEAD(&g.plist, n, list);
 
-	*connected = 0;
-	while(!TAILQ_EMPTY(&g.plist)) {
-		n = TAILQ_FIRST(&g.plist);
+	if(n->expanded == 0) {
+		expand_node(g, n);
+	}
+	if(cmdn->expanded == 0) {
+		expand_node(g, cmdn);
+	}
 
-		if(src != n->tent &&
-		   tupid_tree_search(valid_root, n->tent->tnode.tupid) != NULL) {
-			*connected = 1;
-			goto out_cleanup;
-		}
+	if(create_edge(g->cur, cmdn, TUP_LINK_NORMAL) < 0)
+		return -1;
+	if(create_edge(cmdn, n, TUP_LINK_NORMAL) < 0)
+		return -1;
 
-		if(n->state == STATE_INITIALIZED) {
-			DEBUGP("find deps for node: %lli\n", n->tnode.tupid);
-			g.cur = n;
-			if(tup_db_select_node_by_link(add_file_cb, &g, n->tnode.tupid) < 0)
-				return -1;
-			n->state = STATE_PROCESSING;
-		} else if(n->state == STATE_PROCESSING) {
-			DEBUGP("remove node from stack: %lli\n", n->tnode.tupid);
-			TAILQ_REMOVE(&g.plist, n, list);
-			TAILQ_INSERT_TAIL(&g.node_list, n, list);
-			n->state = STATE_FINISHED;
-		} else if(n->state == STATE_FINISHED) {
-			fprintf(stderr, "tup internal error: STATE_FINISHED node %lli in plist\n", n->tnode.tupid);
-			tup_db_print(stderr, n->tnode.tupid);
+	return 0;
+}
+
+int build_graph(struct graph *g)
+{
+	struct node *cur;
+
+	while(!TAILQ_EMPTY(&g->plist)) {
+		cur = TAILQ_FIRST(&g->plist);
+		if(cur->state == STATE_INITIALIZED) {
+			DEBUGP("find deps for node: %lli\n", cur->tnode.tupid);
+			g->cur = cur;
+			if(g->style == TUP_LINK_GROUP) {
+				if(tup_db_select_node_by_group_link(build_group_cb, g, cur->tnode.tupid) < 0)
+					return -1;
+			} else {
+				if(tup_db_select_node_by_link(build_graph_cb, g, cur->tnode.tupid) < 0)
+					return -1;
+			}
+			cur->state = STATE_PROCESSING;
+		} else if(cur->state == STATE_PROCESSING) {
+			DEBUGP("remove node from stack: %lli\n", cur->tnode.tupid);
+			TAILQ_REMOVE(&g->plist, cur, list);
+			TAILQ_INSERT_TAIL(&g->node_list, cur, list);
+			cur->state = STATE_FINISHED;
+		} else if(cur->state == STATE_FINISHED) {
+			fprintf(stderr, "tup internal error: STATE_FINISHED node %lli in plist\n", cur->tnode.tupid);
+			tup_db_print(stderr, cur->tnode.tupid);
 			return -1;
 		}
 	}
 
-out_cleanup:
-	if(destroy_graph(&g) < 0)
-		return -1;
+	if(g->style != TUP_LINK_GROUP)
+		if(add_graph_stickies(g) < 0)
+			return -1;
+
+	return 0;
+}
+
+int graph_empty(struct graph *g)
+{
+	if(g->node_list.tqh_last == &TAILQ_NEXT(g->root, list))
+		return 1;
+	return 0;
+}
+
+int add_graph_stickies(struct graph *g)
+{
+	struct node *n;
+
+	TAILQ_FOREACH(n, &g->node_list, list) {
+		if(n->tent->type == TUP_NODE_CMD) {
+			struct tupid_entries sticky_root = {NULL};
+			struct tupid_tree *tt;
+			struct node *inputn;
+
+			if(tup_db_get_inputs(n->tent->tnode.tupid, &sticky_root, NULL) < 0)
+				return -1;
+			RB_FOREACH(tt, tupid_entries, &sticky_root) {
+				inputn = find_node(g, tt->tupid);
+				if(inputn) {
+					if(create_edge(inputn, n, TUP_LINK_STICKY) < 0)
+						return -1;
+				}
+			}
+			free_tupid_tree(&sticky_root);
+		}
+	}
 	return 0;
 }
 
@@ -290,7 +362,14 @@ static void mark_nodes(struct node *n)
 		if(mark->tent->type == TUP_NODE_CMD) {
 			struct edge *e2;
 			LIST_FOREACH(e2, &mark->edges, list) {
-				mark_nodes(e2->dest);
+				struct node *dest = e2->dest;
+
+				/* Groups are skipped, otherwise we end up
+				 * building everything in the group (t3058).
+				 */
+				if(dest->tent->type != TUP_NODE_GROUP) {
+					mark_nodes(dest);
+				}
 			}
 		}
 	}
@@ -385,28 +464,29 @@ out_err:
 	return -1;
 }
 
-static void dump_node(FILE *f, struct node *n)
+void trim_graph(struct graph *g)
 {
-	struct edge *e;
-	int color = 0;
-	int flags;
-
-	flags = tup_db_get_node_flags(n->tnode.tupid);
-	if(flags & TUP_FLAGS_CREATE)
-		color |= 0x00bb00;
-	if(flags & TUP_FLAGS_MODIFY)
-		color |= 0x0000ff;
-	fprintf(f, "tup%p [label=\"%s [%lli] (%i, %i)\",color=\"#%06x\"];\n",
-		n, n->tent->name.s, n->tnode.tupid, LIST_EMPTY(&n->incoming), n->expanded, color);
-	LIST_FOREACH(e, &n->edges, list) {
-		fprintf(f, "tup%p -> tup%p [dir=back,style=\"%s\",arrowtail=\"%s\"];\n", e->dest, n, (e->style == TUP_LINK_STICKY) ? "dotted" : "solid", (e->style & TUP_LINK_STICKY) ? "normal" : "empty");
-	}
+	struct node *n;
+	struct node *tmp;
+	int nodes_removed;
+	do {
+		nodes_removed = 0;
+		TAILQ_FOREACH_SAFE(n, &g->node_list, list, tmp) {
+			/* Get rid of any node that is either at the root or a
+			 * leaf - nodes in the cycle will have both incoming
+			 * and outgoing edges.
+			 */
+			if(LIST_EMPTY(&n->incoming) || LIST_EMPTY(&n->edges)) {
+				remove_node_internal(g, n);
+				nodes_removed = 1;
+			}
+		}
+	} while(nodes_removed);
 }
 
-void dump_graph(const struct graph *g, const char *filename)
+void save_graph(FILE *err, struct graph *g, const char *filename)
 {
 	static int count = 0;
-	struct node *n;
 	char realfile[PATH_MAX];
 	FILE *f;
 
@@ -414,20 +494,197 @@ void dump_graph(const struct graph *g, const char *filename)
 		perror("asprintf");
 		return;
 	}
-	fprintf(stderr, "tup: dumping graph '%s'\n", realfile);
+	fprintf(err, "tup: saving graph '%s'\n", realfile);
+
 	count++;
 	f = fopen(realfile, "w");
 	if(!f) {
 		perror(realfile);
 		return;
 	}
+	dump_graph(g, f, 1, 0, 0);
+	fclose(f);
+}
+
+static void print_name(FILE *f, const char *s, char c)
+{
+	for(; *s && *s != c; s++) {
+		if(*s == '"') {
+			fprintf(f, "\\\"");
+		} else if(*s == '\\') {
+			fprintf(f, "\\\\");
+		} else {
+			fprintf(f, "%c", *s);
+		}
+	}
+}
+
+static void dump_node(FILE *f, struct graph *g, struct node *n,
+		      int show_dirs, int show_env, int show_ghosts)
+{
+	int color;
+	int fontcolor;
+	const char *shape;
+	const char *style;
+	char *s;
+	struct edge *e;
+	int flags;
+
+	if(n == g->root)
+		return;
+
+	if(!show_env) {
+		if(n->tent->tnode.tupid == env_dt() ||
+		   n->tent->dt == env_dt())
+			return;
+	}
+
+	style = "solid";
+	color = 0;
+	fontcolor = 0;
+	switch(n->tent->type) {
+		case TUP_NODE_FILE:
+		case TUP_NODE_GENERATED:
+			/* Skip Tupfiles in no-dirs mode since they
+			 * point to directories.
+			 */
+			if(!show_dirs && strcmp(n->tent->name.s, "Tupfile") == 0)
+				return;
+			shape = "oval";
+			break;
+		case TUP_NODE_CMD:
+			shape = "rectangle";
+			break;
+		case TUP_NODE_DIR:
+			if(!show_dirs)
+				return;
+			shape = "diamond";
+			break;
+		case TUP_NODE_VAR:
+			shape = "octagon";
+			break;
+		case TUP_NODE_GHOST:
+			if(!show_ghosts)
+				return;
+			/* Ghost nodes won't have flags set */
+			color = 0x888888;
+			fontcolor = 0x888888;
+			style = "dotted";
+			shape = "oval";
+			break;
+		case TUP_NODE_GROUP:
+			shape = "hexagon";
+			break;
+		case TUP_NODE_ROOT:
+		default:
+			shape="ellipse";
+	}
+
+	flags = tup_db_get_node_flags(n->tnode.tupid);
+	if(flags & TUP_FLAGS_MODIFY) {
+		color |= 0x0000ff;
+		style = "dashed";
+	}
+	if(flags & TUP_FLAGS_CREATE) {
+		color |= 0x00ff00;
+		style = "dashed peripheries=2";
+	}
+	if(n->expanded == 0) {
+		if(color == 0) {
+			color = 0x888888;
+			fontcolor = 0x888888;
+		} else {
+			/* Might only be graphing a subset. Ie:
+			 * graph node foo, which points to command bar,
+			 * and command bar is in the modify list. In
+			 * this case, bar won't be expanded.
+			 */
+		}
+	}
+	fprintf(f, "\tnode_%lli [label=\"", n->tnode.tupid);
+	s = n->tent->name.s;
+	if(s[0] == '^') {
+		s++;
+		while(*s && *s != ' ') {
+			/* Skip flags (Currently there are none) */
+			s++;
+		}
+		print_name(f, s, '^');
+	} else {
+		print_name(f, s, 0);
+	}
+	fprintf(f, "\\n%lli\" shape=\"%s\" color=\"#%06x\" fontcolor=\"#%06x\" style=%s];\n", n->tnode.tupid, shape, color, fontcolor, style);
+	if(show_dirs && n->tent->dt) {
+		struct node *tmp;
+		tmp = find_node(g, n->tent->dt);
+		if(tmp)
+			fprintf(f, "\tnode_%lli -> node_%lli [dir=back color=\"#888888\" arrowtail=odot]\n", n->tnode.tupid, n->tent->dt);
+	}
+
+	LIST_FOREACH(e, &n->edges, list) {
+		fprintf(f, "\tnode_%lli -> node_%lli [dir=back,style=\"%s\",arrowtail=\"%s\"]\n", e->dest->tnode.tupid, n->tnode.tupid, (e->style == TUP_LINK_STICKY) ? "dotted" : "solid", (e->style & TUP_LINK_STICKY) ? "normal" : "empty");
+	}
+}
+
+void dump_graph(struct graph *g, FILE *f, int show_dirs, int show_env, int show_ghosts)
+{
+	struct node *n;
+
 	fprintf(f, "digraph G {\n");
 	TAILQ_FOREACH(n, &g->node_list, list) {
-		dump_node(f, n);
+		dump_node(f, g, n, show_dirs, show_env, show_ghosts);
 	}
 	TAILQ_FOREACH(n, &g->plist, list) {
-		dump_node(f, n);
+		dump_node(f, g, n, show_dirs, show_env, show_ghosts);
 	}
 	fprintf(f, "}\n");
-	fclose(f);
+}
+
+int group_need_circ_check(void)
+{
+	return group_graph_inited;
+}
+
+int add_group_circ_check(struct tup_entry *tent)
+{
+	struct node *n;
+	if(!group_graph_inited) {
+		if(create_graph(&group_graph, TUP_NODE_GROUP) < 0)
+			return -1;
+		group_graph_inited = 1;
+	}
+	if(find_node(&group_graph, tent->tnode.tupid) != NULL)
+		return 0;
+
+	n = create_node(&group_graph, tent);
+	if(!n) {
+		return -1;
+	}
+	TAILQ_REMOVE(&group_graph.node_list, n, list);
+	TAILQ_INSERT_HEAD(&group_graph.plist, n, list);
+	return 0;
+}
+
+int group_circ_check(void)
+{
+	if(!group_graph_inited)
+		return 0;
+	if(build_graph(&group_graph) < 0)
+		return -1;
+	trim_graph(&group_graph);
+	if(!TAILQ_EMPTY(&group_graph.node_list)) {
+		struct node *n;
+		fprintf(stderr, "tup error: Circular dependency found among the following groups:\n");
+		TAILQ_FOREACH(n, &group_graph.node_list, list) {
+			if(n->tent->type == TUP_NODE_GROUP) {
+				fprintf(stderr, " - ");
+				print_tup_entry(stderr, n->tent);
+				fprintf(stderr, "\n");
+			}
+		}
+		fprintf(stderr, "See the saved graph for the commands involved.\n");
+		save_graph(stderr, &group_graph, ".tup/tmp/graph-group-circular-%i.dot");
+		return -1;
+	}
+	return 0;
 }

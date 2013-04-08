@@ -2,7 +2,7 @@
  *
  * tup - A file-based build system
  *
- * Copyright (C) 2008-2012  Mike Shal <marfey@gmail.com>
+ * Copyright (C) 2008-2013  Mike Shal <marfey@gmail.com>
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 2 as
@@ -23,6 +23,7 @@
 
 #include "file.h"
 #include "bsd/queue.h"
+#include "string_tree.h"
 #include <pthread.h>
 
 struct tupid_entries;
@@ -42,17 +43,23 @@ struct server {
 };
 
 struct parser_entry {
+	/* parser_directory gets one of these for each file in a directory */
 	char *name;
 	LIST_ENTRY(parser_entry) list;
 };
 LIST_HEAD(parser_entry_head, parser_entry);
 
+struct parser_directory {
+	/* parser_server gets one of these for each directory that is preloaded with files. */
+	struct string_tree st;
+	struct parser_entry_head file_list;
+};
+
 struct parser_server {
 	struct server s;
 	int root_fd;
 	struct parser_server *oldps;
-	char path[PATH_MAX];
-	struct parser_entry_head file_list;
+	struct string_entries directories;
 	pthread_mutex_t lock;
 };
 
@@ -75,7 +82,7 @@ int server_config_stop(struct server *s);
 int server_parser_start(struct parser_server *ps);
 int server_parser_stop(struct parser_server *ps);
 
-int server_run_script(tupid_t tupid, const char *cmdline,
+int server_run_script(FILE *f, tupid_t tupid, const char *cmdline,
 		      struct tupid_entries *env_root, char **rules);
 
 #endif

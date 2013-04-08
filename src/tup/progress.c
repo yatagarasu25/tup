@@ -90,7 +90,11 @@ void tup_show_message(const char *s)
 void clear_active(FILE *f)
 {
 	if(is_active) {
-		int console_width = tup_option_get_int("display.width");
+		/* Subtract 1 so we don't scroll to the next line if we print
+		 * exactly the correct amount of characters for a row. At least
+		 * Windows does this.
+		 */
+		int console_width = tup_option_get_int("display.width") - 1;
 		char spaces[console_width];
 		memset(spaces, ' ', console_width);
 		printf("\r%.*s\r", console_width, spaces);
@@ -238,11 +242,11 @@ static int get_time_remaining(char *dest, int len, int part, int whole, int appr
 		if(time_left < 1000) {
 			return snprintf(dest, len, "ETA%s<1s", eq);
 		} else if(time_left < 60000) {
-			return snprintf(dest, len, "ETA%s%lis", eq, time_left/1000 + 1);
+			return snprintf(dest, len, "ETA%s%lis", eq, (long int)time_left/1000 + 1);
 		} else if(time_left < 3600000) {
-			return snprintf(dest, len, "ETA%s%lim", eq, time_left/60000 + 1);
+			return snprintf(dest, len, "ETA%s%lim", eq, (long int)time_left/60000 + 1);
 		} else if(time_left < 356400000) {
-			return snprintf(dest, len, "ETA%s%lih", eq, time_left/3600000 + 1);
+			return snprintf(dest, len, "ETA%s%lih", eq, (long int)time_left/3600000 + 1);
 		}
 	}
 	return snprintf(dest, len, "ETA%s???", eq);

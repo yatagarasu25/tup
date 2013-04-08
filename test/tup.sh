@@ -1,7 +1,7 @@
 #! /bin/sh
 # tup - A file-based build system
 #
-# Copyright (C) 2008-2012  Mike Shal <marfey@gmail.com>
+# Copyright (C) 2008-2013  Mike Shal <marfey@gmail.com>
 #
 # This program is free software; you can redistribute it and/or modify
 # it under the terms of the GNU General Public License version 2 as
@@ -163,13 +163,15 @@ tup_object_no_exist()
 	done
 }
 
-tup_dep_exist()
+dep_exist_internal()
 {
+	link_type=$1
+	shift
 	set +e
-	tup link_exists "$1" "$2" "$3" "$4"
+	tup ${link_type}_exists "$1" "$2" "$3" "$4"
 	rc=$?
 	set -e
-	if [ "$rc" = "1" ]; then
+	if [ "$rc" = "11" ]; then
 		:
 	elif [ "$rc" = "0" ]; then
 		echo "*** Dependency from $2 [$1] -> $4 [$3] does not exist" 1>&2
@@ -180,15 +182,17 @@ tup_dep_exist()
 	fi
 }
 
-tup_dep_no_exist()
+dep_no_exist_internal()
 {
+	link_type=$1
+	shift
 	if tup node_exists "$1" "$2"; then
 		if tup node_exists "$3" "$4"; then
 			set +e
-			tup link_exists "$1" "$2" "$3" "$4"
+			tup ${link_type}_exists "$1" "$2" "$3" "$4"
 			rc=$?
 			set -e
-			if [ "$rc" = "1" ]; then
+			if [ "$rc" = "11" ]; then
 				echo "*** Dependency from $2 [$1] -> $4 [$3] exists when it shouldn't" 1>&2
 				exit 1
 			elif [ "$rc" = "0" ]; then
@@ -205,6 +209,26 @@ tup_dep_no_exist()
 		echo "*** Object $2 [$1] does not exist" 1>&2
 		exit 1;
 	fi
+}
+
+tup_dep_exist()
+{
+	dep_exist_internal normal "$1" "$2" "$3" "$4"
+}
+
+tup_dep_no_exist()
+{
+	dep_no_exist_internal normal "$1" "$2" "$3" "$4"
+}
+
+tup_sticky_exist()
+{
+	dep_exist_internal sticky "$1" "$2" "$3" "$4"
+}
+
+tup_sticky_no_exist()
+{
+	dep_no_exist_internal sticky "$1" "$2" "$3" "$4"
 }
 
 set_leak_check()
@@ -303,6 +327,30 @@ parse_fail_msg()
 			echo "Parsing expected to fail, and failed for the right reason."
 		else
 			echo "*** Parsing expected to fail because of: $1" 1>&2
+			echo "*** But failed because of:" 1>&2
+			cat .tupoutput 1>&2
+			exit 1
+		fi
+	fi
+}
+
+refactor()
+{
+	if ! tup refactor; then
+		exit 1
+	fi
+}
+
+refactor_fail_msg()
+{
+	if tup refactor 2>.tupoutput; then
+		echo "*** Expected refactoring to fail, but didn't" 1>&2
+		exit 1
+	else
+		if grep "$1" .tupoutput > /dev/null; then
+			echo "Refactoring expected to fail, and failed for the right reason."
+		else
+			echo "*** Refactoring expected to fail because of: $1" 1>&2
 			echo "*** But failed because of:" 1>&2
 			cat .tupoutput 1>&2
 			exit 1
@@ -494,10 +542,7 @@ HERE
 	if [ "$tupos" = "SunOS" ]; then
 		plat_ldflags="$plat_ldflags -lsocket"
 	fi
-	if [ "$tupos" != "FreeBSD" ]; then
-		plat_ldflags="$plat_ldflags -ldl"
-	fi
-	gcc client.c ../../libtup_client.a -o client $plat_ldflags
+	gcc client.c ../../libtup_client.a -o client $plat_ldflags -ldl
 	tup touch client
 }
 
@@ -509,6 +554,20 @@ check_monitor_supported()
 		echo "Monitor is not supported. Skipping test."
 		eotup
 	fi
+}
+
+check_windows()
+{
+	case $tupos in
+	CYGWIN*)
+		return
+		;;
+	MINGW*)
+		return
+		;;
+	esac
+	echo "Only supported in Windows. Skipping test."
+	eotup
 }
 
 check_no_windows()

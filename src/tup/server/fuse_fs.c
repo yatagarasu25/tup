@@ -123,7 +123,7 @@ static const char *peel(const char *path)
 		if(slash) {
 			path = slash;
 		} else {
-			path = ".";
+			path = "/";
 		}
 
 	}
@@ -407,9 +407,7 @@ static int tup_fs_getattr(const char *path, struct stat *stbuf)
 	} else {
 		rc = 0;
 	}
-	if(!S_ISDIR(stbuf->st_mode)) {
-		tup_fuse_handle_file(path, stripped, ACCESS_READ);
-	}
+	tup_fuse_handle_file(path, stripped, ACCESS_READ);
 
 	return rc;
 }
@@ -737,11 +735,10 @@ static int tup_fs_readdir(const char *path, void *buf, fuse_fill_dir_t filler,
 	return fill_actual_directory(peeled, buf, filler, finfo != NULL, NULL);
 }
 
-static int tup_fs_mknod(const char *path, mode_t mode, dev_t rdev)
+static int mknod_internal(const char *path, mode_t mode, int flags, int close_fd)
 {
 	int rc;
 	struct mapping *map;
-	if(rdev) {}
 
 	if(context_check() < 0)
 		return -EPERM;
@@ -749,7 +746,6 @@ static int tup_fs_mknod(const char *path, mode_t mode, dev_t rdev)
 	/* On Linux this could just be 'mknod(path, mode, rdev)' but this
 	   is more portable */
 	if (S_ISREG(mode)) {
-		int flags = O_CREAT | O_EXCL | O_WRONLY;
 		map = add_mapping(path);
 		if(!map) {
 			return -ENOMEM;
@@ -760,8 +756,11 @@ static int tup_fs_mknod(const char *path, mode_t mode, dev_t rdev)
 			rc = openat(tup_top_fd(), map->tmpname, flags, mode);
 			if(rc < 0)
 				return -errno;
-			if(close(rc) < 0)
-				return -errno;
+			if(close_fd) {
+				if(close(rc) < 0)
+					return -errno;
+				rc = 0;
+			}
 		}
 	} else if S_ISFIFO(mode) {
 		map = add_mapping(path);
@@ -780,7 +779,13 @@ static int tup_fs_mknod(const char *path, mode_t mode, dev_t rdev)
 		return -EPERM;
 	}
 
-	return 0;
+	return rc;
+}
+
+static int tup_fs_mknod(const char *path, mode_t mode, dev_t rdev)
+{
+	if(rdev) {}
+	return mknod_internal(path, mode, O_CREAT | O_EXCL | O_WRONLY, 1);
 }
 
 static int tup_fs_mkdir(const char *path, mode_t mode)
@@ -800,15 +805,16 @@ static int tup_fs_mkdir(const char *path, mode_t mode)
 		if(!tmpdir) {
 			perror("malloc");
 			rc = -ENOMEM;
-		}
-		tmpdir->dirname = strdup(peel(path));
-		if(!tmpdir->dirname) {
-			perror("strdup");
-			rc = -ENOMEM;
-		}
-		if(tmpdir && tmpdir->dirname) {
-			LIST_INSERT_HEAD(&finfo->tmpdir_list, tmpdir, list);
-			rc = 0;
+		} else {
+			tmpdir->dirname = strdup(peel(path));
+			if(!tmpdir->dirname) {
+				perror("strdup");
+				rc = -ENOMEM;
+			}
+			if(tmpdir && tmpdir->dirname) {
+				LIST_INSERT_HEAD(&finfo->tmpdir_list, tmpdir, list);
+				rc = 0;
+			}
 		}
 		put_finfo(finfo);
 		return rc;
@@ -1036,7 +1042,6 @@ static int tup_fs_utimens(const char *path, const struct timespec ts[2])
 	if(context_check() < 0)
 		return -EPERM;
 
-	peeled = peel(path);
 	finfo = get_finfo(path);
 	if(finfo) {
 		map = find_mapping(finfo, path);
@@ -1054,6 +1059,16 @@ static int tup_fs_utimens(const char *path, const struct timespec ts[2])
 	}
 	fprintf(stderr, "tup error: Unable to utimens() files not created by this job.\n");
 	return -EPERM;
+}
+
+static int tup_fs_create(const char *path, mode_t mode, struct fuse_file_info *fi)
+{
+	int rc;
+	rc = mknod_internal(path, mode, fi->flags, 0);
+	if(rc < 0)
+		return -errno;
+	fi->fh = rc;
+	return 0;
 }
 
 static int tup_fs_open(const char *path, struct fuse_file_info *fi)
@@ -1170,6 +1185,31 @@ static int tup_fs_statfs(const char *path, struct statvfs *stbuf)
 	return rc;
 }
 
+static int tup_fs_flush(const char *path, struct fuse_file_info *fi)
+{
+	/* We don't actually do anything here, but without flush() sometimes
+	 * the sub-process will finish before our fuse fs finishes writing out
+	 * all data and calling release(). Eg, if we have a command that does
+	 * 'cp bigfile.txt newbigfile.txt', where bigfile.txt contains a lot of
+	 * data, then the waitpid() in master_fork returns before release() is
+	 * called. We then end up stating the output file and gettnig a bad
+	 * timestamp since data is still being written out. (The file is
+	 * written correctly, but our mtime that we store in the db is already
+	 * out of date).
+	 *
+	 * This implementation just mimics what fusexmp_fh does, though the
+	 * close(dup()) doesn't seem to actually be necessary to fix the above
+	 * behavior in tup.
+	 */
+	int rc;
+	if(path) {}
+
+	rc = close(dup(fi->fh));
+	if(rc < 0)
+		return -errno;
+	return 0;
+}
+
 static int tup_fs_release(const char *path, struct fuse_file_info *fi)
 {
 	if(path) {}
@@ -1182,6 +1222,7 @@ static int tup_fs_release(const char *path, struct fuse_file_info *fi)
 
 struct fuse_operations tup_fs_oper = {
 	.getattr = tup_fs_getattr,
+	.flush = tup_fs_flush,
 	.access = tup_fs_access,
 	.readlink = tup_fs_readlink,
 	.readdir = tup_fs_readdir,
@@ -1196,6 +1237,7 @@ struct fuse_operations tup_fs_oper = {
 	.chown = tup_fs_chown,
 	.truncate = tup_fs_truncate,
 	.utimens = tup_fs_utimens,
+	.create = tup_fs_create,
 	.open = tup_fs_open,
 	.read = tup_fs_read,
 	.write = tup_fs_write,

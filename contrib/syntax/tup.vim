@@ -1,5 +1,14 @@
 " Vim syntax file
 " Language:     Tupfile
+"
+" HOWTO use:
+" 1) Add this to your ~/.vim/filetype.vim -
+" au BufNewFile,BufRead Tupfile,*.tup setf tup
+"
+" 2) Add a symlink to this file in ~/.vim/syntax/ -
+" mkdir -p ~/.vim/syntax
+" cd ~/.vim/syntax
+" ln -s /path/to/tup.vim
 
 " For version 5.x: Clear all syntax items
 " For version 6.x: Quit when a syntax file was already loaded
@@ -18,8 +27,8 @@ syntax match chain ,^*[a-zA-Z0-9_-][a-zA-Z0-9_-]*,
 syntax match chain ,[^a-zA-Z0-9_-]\*[a-zA-Z0-9_-][a-zA-Z0-9_-]*,
 syntax match separator /|>/
 syntax match reverseseparator /<|/
-syntax match format display "%\([%efoOBb]\)" contained
-syntax match errfmt display "%\([^%efoOBb]\)" contained
+syntax match format display "%\([%efoOBbd]\)" contained
+syntax match errfmt display "%\([^%efoOBbd]\)" contained
 syntax match variable /$([^)]*)/
 syntax match variable /{[^}]*}/
 syntax match atvar /@([^)]*)/

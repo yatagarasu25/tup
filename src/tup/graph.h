@@ -2,7 +2,7 @@
  *
  * tup - A file-based build system
  *
- * Copyright (C) 2008-2012  Mike Shal <marfey@gmail.com>
+ * Copyright (C) 2008-2013  Mike Shal <marfey@gmail.com>
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 2 as
@@ -25,6 +25,7 @@
 #include "tupid_tree.h"
 #include "db_types.h"
 #include <time.h>
+#include <stdio.h>
 
 struct edge {
 	LIST_ENTRY(edge) list;
@@ -71,6 +72,7 @@ struct graph {
 	int gen_delete_count;
 	struct tupid_entries cmd_delete_root;
 	int cmd_delete_count;
+	int style;
 };
 
 struct node *find_node(struct graph *g, tupid_t tupid);
@@ -82,10 +84,18 @@ void remove_edge(struct edge *e);
 
 int create_graph(struct graph *g, enum TUP_NODE_TYPE count_flags);
 int destroy_graph(struct graph *g);
+void save_graphs(struct graph *g);
+int build_graph_cb(void *arg, struct tup_entry *tent);
+int build_graph(struct graph *g);
 int graph_empty(struct graph *g);
-int nodes_are_connected(struct tup_entry *src, struct tupid_entries *dest_head,
-			int *connected);
+int add_graph_stickies(struct graph *g);
 int prune_graph(struct graph *g, int argc, char **argv, int *num_pruned);
-void dump_graph(const struct graph *g, const char *filename);
+void trim_graph(struct graph *g);
+void save_graph(FILE *err, struct graph *g, const char *filename);
+void dump_graph(struct graph *g, FILE *f, int show_dirs, int show_env, int show_ghosts);
+
+int group_need_circ_check(void);
+int add_group_circ_check(struct tup_entry *tent);
+int group_circ_check(void);
 
 #endif

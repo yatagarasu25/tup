@@ -2,7 +2,7 @@
  *
  * tup - A file-based build system
  *
- * Copyright (C) 2008-2012  Mike Shal <marfey@gmail.com>
+ * Copyright (C) 2008-2013  Mike Shal <marfey@gmail.com>
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 2 as
@@ -80,6 +80,7 @@ struct path_list {
 	/* For files: */
 	char *path;
 	struct path_element *pel;
+	int group;
 	tupid_t dt;
 	/* For bins: */
 	struct bin *bin;
@@ -145,6 +146,7 @@ struct tupfile {
 	struct tup_entry *srctent;
 	int cur_dfd;
 	int root_fd;
+	int refactoring;
 	struct graph *g;
 	struct vardb vdb;
 	struct node_vardb node_db;
@@ -153,6 +155,7 @@ struct tupfile {
 	struct string_entries bang_root;
 	struct tupid_entries input_root;
 	struct string_entries chain_root;
+	struct tupid_entries refactoring_cmd_delete_root;
 	FILE *f;
 	struct parser_server *ps;
 	struct timespan ts;
@@ -164,6 +167,7 @@ static int parse_tupfile(struct tupfile *tf, struct buf *b, const char *filename
 static int var_ifdef(struct tupfile *tf, const char *var);
 static int eval_eq(struct tupfile *tf, char *expr, char *eol);
 static int include_rules(struct tupfile *tf);
+static int preload(struct tupfile *tf, char *cmdline);
 static int run_script(struct tupfile *tf, char *cmdline, int lno,
 		      struct bin_head *bl);
 static int export(struct tupfile *tf, char *cmdline);
@@ -181,6 +185,7 @@ static void free_bang_rule(struct string_entries *root, struct bang_rule *br);
 static void free_bang_tree(struct string_entries *root);
 static void free_chain_tree(struct string_entries *root);
 static void free_banglist(struct bang_list_head *head);
+static void free_dir_lists(struct string_entries *root);
 static int split_input_pattern(struct tupfile *tf, char *p, char **o_input,
 			       char **o_cmd, int *o_cmdlen, char **o_output,
 			       char **o_bin, int *swapio);
@@ -202,10 +207,10 @@ static int input_pattern_to_nl(struct tupfile *tf, char *p,
 static int get_path_list(struct tupfile *tf, char *p, struct path_list_head *plist,
 			 tupid_t dt, struct bin_head *bl);
 static void make_path_list_unique(struct path_list_head *plist);
+static void free_path_list(struct path_list_head *plist);
 static void del_pl(struct path_list *pl, struct path_list_head *head);
 static void make_name_list_unique(struct name_list *nl);
-static int parse_dependent_tupfiles(struct path_list_head *plist,
-				    struct tupfile *tf, struct graph *g);
+static int parse_dependent_tupfiles(struct path_list_head *plist, struct tupfile *tf);
 static int get_name_list(struct tupfile *tf, struct path_list_head *plist,
 			 struct name_list *nl, int required);
 static int nl_add_path(struct tupfile *tf, struct path_list *pl,
@@ -228,7 +233,7 @@ static void move_name_list_entry(struct name_list *newnl, struct name_list *oldn
 static void move_name_list(struct name_list *newnl, struct name_list *oldnl);
 static char *tup_printf(struct tupfile *tf, const char *cmd, int cmd_len,
 			struct name_list *nl, struct name_list *onl,
-			const char *ext, int extlen, int is_command);
+			const char *ext, int extlen);
 static char *eval(struct tupfile *tf, const char *string, int allow_nodes);
 
 static int debug_run = 0;
@@ -238,7 +243,7 @@ void parser_debug_run(void)
 	debug_run = 1;
 }
 
-int parse(struct node *n, struct graph *g, struct timespan *retts)
+int parse(struct node *n, struct graph *g, struct timespan *retts, int refactoring)
 {
 	struct tupfile tf;
 	int fd;
@@ -268,16 +273,18 @@ int parse(struct node *n, struct graph *g, struct timespan *retts)
 	init_file_info(&ps.s.finfo, tf.variant->variant_dir);
 	ps.s.id = n->tnode.tupid;
 	pthread_mutex_init(&ps.lock, NULL);
-	memset(ps.path, 0, sizeof(ps.path));
-	if(snprint_tup_entry(ps.path, sizeof(ps.path), n->tent) >= (signed)sizeof(ps.path)) {
-		fprintf(stderr, "tup internal error: ps.path is sized incorrectly in parse()\n");
-		return -1;
-	}
+
 	RB_INIT(&tf.cmd_root);
 	RB_INIT(&tf.env_root);
 	RB_INIT(&tf.bang_root);
 	RB_INIT(&tf.input_root);
 	RB_INIT(&tf.chain_root);
+	RB_INIT(&ps.directories);
+
+	if(refactoring) {
+		RB_INIT(&tf.refactoring_cmd_delete_root);
+	}
+
 	if(server_parser_start(&ps) < 0)
 		return -1;
 
@@ -285,6 +292,7 @@ int parse(struct node *n, struct graph *g, struct timespan *retts)
 	tf.curtent = tup_entry_get(tf.tupid);
 	tf.root_fd = ps.root_fd;
 	tf.g = g;
+	tf.refactoring = refactoring;
 	if(tf.variant->root_variant) {
 		tf.srctent = NULL;
 	} else {
@@ -309,6 +317,11 @@ int parse(struct node *n, struct graph *g, struct timespan *retts)
 	if(tup_db_dirtype_to_tree(tf.tupid, &g->gen_delete_root, &g->gen_delete_count, TUP_NODE_GENERATED) < 0)
 		goto out_close_vdb;
 
+	if(refactoring) {
+		if(tup_db_dirtype_to_tree(tf.tupid, &tf.refactoring_cmd_delete_root, NULL, TUP_NODE_CMD) < 0)
+			goto out_close_vdb;
+	}
+
 	tf.cur_dfd = tup_entry_openat(ps.root_fd, n->tent);
 	if(tf.cur_dfd < 0) {
 		fprintf(tf.f, "tup error: Unable to open directory ID %lli\n", tf.tupid);
@@ -332,11 +345,24 @@ int parse(struct node *n, struct graph *g, struct timespan *retts)
 	if(parse_tupfile(&tf, &b, "Tupfile") < 0)
 		goto out_free_bs;
 	if(tf.ign) {
-		if(rm_existing_gitignore(&tf, n->tent) < 0)
-			return -1;
+		if(!refactoring) {
+			if(rm_existing_gitignore(&tf, n->tent) < 0)
+				return -1;
+		}
 		if(gitignore(&tf) < 0) {
 			rc = -1;
 			goto out_free_bs;
+		}
+	} else {
+		if(refactoring) {
+			struct tup_entry *tent;
+			if(tup_db_select_tent(tf.tupid, ".gitignore", &tent) < 0)
+				return -1;
+			if(tent && tent->type == TUP_NODE_GENERATED) {
+				fprintf(tf.f, "tup refactoring error: Attempting to remove the .gitignore file.\n");
+				rc = -1;
+				goto out_free_bs;
+			}
 		}
 	}
 	rc = 0;
@@ -363,11 +389,28 @@ out_server_stop:
 		rc = -1;
 
 	if(rc == 0) {
+		if(refactoring) {
+			struct tupid_tree *tt;
+			struct tup_entry *tent;
+
+			RB_FOREACH(tt, tupid_entries, &tf.refactoring_cmd_delete_root) {
+				rc = -1;
+				if(tup_entry_add(tt->tupid, &tent) < 0)
+					return -1;
+				fprintf(tf.f, "tup refactoring error: Attempting to delete a command: ");
+				print_tup_entry(tf.f, tent);
+				fprintf(tf.f, "\n");
+			}
+		}
 		if(add_parser_files(tf.f, &ps.s.finfo, &tf.input_root, tf.variant->tent->tnode.tupid) < 0)
 			rc = -1;
-		if(tup_db_write_dir_inputs(tf.tupid, &tf.input_root) < 0)
+		if(tup_db_write_dir_inputs(tf.f, tf.tupid, &tf.input_root, refactoring) < 0)
 			rc = -1;
 	}
+
+	pthread_mutex_lock(&ps.lock);
+	free_dir_lists(&ps.directories);
+	pthread_mutex_unlock(&ps.lock);
 
 	free_chain_tree(&tf.chain_root);
 	free_tupid_tree(&tf.env_root);
@@ -392,7 +435,7 @@ out_server_stop:
 		rc = -1;
 	}
 	rewind(tf.f);
-	display_output(fileno(tf.f), rc == 0 ? 0 : 3, NULL, 0);
+	display_output(fileno(tf.f), rc == 0 ? 0 : 3, NULL, 0, NULL);
 	if(fclose(tf.f) != 0) {
 		/* Use perror, since we're trying to close the tf.f output */
 		perror("fclose");
@@ -402,6 +445,17 @@ out_server_stop:
 		rc = CIRCULAR_DEPENDENCY_ERROR;
 
 	return rc;
+}
+
+static char *get_newline(char *p)
+{
+	char *newline;
+
+	newline = strchr(p, '\n');
+	if(!newline) {
+		newline = strchr(p, '\0');
+	}
+	return newline;
 }
 
 static int parse_tupfile(struct tupfile *tf, struct buf *b, const char *filename)
@@ -434,10 +488,10 @@ static int parse_tupfile(struct tupfile *tf, struct buf *b, const char *filename
 			break;
 
 		line = p;
-		newline = strchr(p, '\n');
+		newline = get_newline(p);
 		if(!newline) {
-			fprintf(tf->f, "tup error: Missing newline character.\n");
-			fprintf(tf->f, "  Line was: %s\n", line);
+			fprintf(tf->f, "tup error: Unable to find trailing nul-byte.\n");
+			fprintf(tf->f, "  Line was: '%s'\n", line);
 			return -1;
 		}
 		lno++;
@@ -447,10 +501,10 @@ static int parse_tupfile(struct tupfile *tf, struct buf *b, const char *filename
 			}
 			newline[-1] = ' ';
 			newline[0] = ' ';
-			newline = strchr(p, '\n');
+			newline = get_newline(p);
 			if(!newline) {
-				fprintf(tf->f, "tup error: Missing newline character.\n");
-				fprintf(tf->f, "  Line was: %s\n", line);
+				fprintf(tf->f, "tup error: Unable to find trailing nul-byte.\n");
+				fprintf(tf->f, "  Line was: '%s'\n", line);
 				return -1;
 			}
 			lno++;
@@ -516,6 +570,8 @@ static int parse_tupfile(struct tupfile *tf, struct buf *b, const char *filename
 			}
 		} else if(strcmp(line, "include_rules") == 0) {
 			rc = include_rules(tf);
+		} else if(strncmp(line, "preload ", 8) == 0) {
+			rc = preload(tf, line+8);
 		} else if(strncmp(line, "run ", 4) == 0) {
 			rc = run_script(tf, line+4, lno, &bl);
 		} else if(strncmp(line, "export ", 7) == 0) {
@@ -685,28 +741,122 @@ static int readdir_parser_cb(void *arg, struct tup_entry *tent)
 	return 0;
 }
 
-static int gen_dir_list(struct tupfile *tf)
-{
-	struct parser_server *ps = tf->ps;
-	struct readdir_parser_params rpp = {
-		&ps->file_list,
-	};
-	LIST_INIT(&tf->ps->file_list);
-	if(tup_db_select_node_dir_glob(readdir_parser_cb, &rpp, tf->tupid,
-				       "*", -1, &tf->g->gen_delete_root) < 0)
-		return -EIO;
-	return 0;
-}
-
-static void free_dir_list(struct parser_server *ps)
+static void free_dir_list(struct string_entries *root, struct parser_directory *pd)
 {
 	struct parser_entry *pe;
-	while(!LIST_EMPTY(&ps->file_list)) {
-		pe = LIST_FIRST(&ps->file_list);
+	while(!LIST_EMPTY(&pd->file_list)) {
+		pe = LIST_FIRST(&pd->file_list);
 		LIST_REMOVE(pe, list);
 		free(pe->name);
 		free(pe);
 	}
+	string_tree_free(root, &pd->st);
+	free(pd);
+}
+
+static void free_dir_lists(struct string_entries *root)
+{
+	struct string_tree *st;
+
+	while((st = RB_ROOT(root)) != NULL) {
+		struct parser_directory *pd = container_of(st, struct parser_directory, st);
+
+		free_dir_list(root, pd);
+	}
+}
+
+static int gen_dir_list(struct tupfile *tf, tupid_t dt)
+{
+	char path[PATH_MAX];
+	struct tup_entry *tent;
+	struct parser_directory *pd;
+	struct readdir_parser_params rpp;
+	struct string_tree *st;
+
+	if(tup_entry_add(dt, &tent) < 0)
+		return -1;
+	pd = malloc(sizeof *pd);
+	if(!pd) {
+		perror("malloc");
+		return -1;
+	}
+	LIST_INIT(&pd->file_list);
+
+	rpp.head = &pd->file_list;
+
+	if(snprint_tup_entry(path, sizeof(path), tent) >= (signed)sizeof(path)) {
+		fprintf(tf->f, "tup internal error: ps.path is sized incorrectly in gen_dir_list()\n");
+		return -1;
+	}
+	if(tup_db_select_node_dir_glob(readdir_parser_cb, &rpp, dt,
+				       "*", -1, &tf->g->gen_delete_root, 1) < 0)
+		return -EIO;
+	st = string_tree_search(&tf->ps->directories, path, strlen(path));
+	if(st)
+		free_dir_list(&tf->ps->directories, container_of(st, struct parser_directory, st));
+
+	if(string_tree_add(&tf->ps->directories, &pd->st, path) < 0) {
+		fprintf(tf->f, "tup internal error: Unable to add '%s' to the directories string tree\n", path);
+		return -1;
+	}
+	return 0;
+}
+
+static int preload(struct tupfile *tf, char *cmdline)
+{
+	struct path_list_head plist;
+	struct path_list *pl;
+	char *eval_cmdline;
+
+	eval_cmdline = eval(tf, cmdline, ALLOW_NODES);
+	if(!eval_cmdline) {
+		return -1;
+	}
+
+	TAILQ_INIT(&plist);
+	if(get_path_list(tf, eval_cmdline, &plist, tf->curtent->tnode.tupid, NULL) < 0)
+		return -1;
+
+	/* get_path_list() leaves us with the last path uncompleted (since it
+	 * usually just handles filenames), so we resolve the last path here
+	 * and store that in dt.  We don't need the pel for
+	 * parse_dependent_tupfiles().
+	 */
+	TAILQ_FOREACH(pl, &plist, list) {
+		struct tup_entry *tent;
+		if(pl->pel->len == 2 && strncmp(pl->pel->path, "..", 2) == 0) {
+			if(tup_entry_add(pl->dt, &tent) < 0)
+				return -1;
+			if(!tent->parent) {
+				fprintf(tf->f, "tup error: Unable to preload a directory beyond the tup hierarchy.\n");
+				return -1;
+			}
+			tent = tent->parent;
+		} else {
+			if(tup_db_select_tent_part(pl->dt, pl->pel->path, pl->pel->len, &tent) < 0)
+				return -1;
+			if(!tent) {
+				fprintf(tf->f, "tup error: Unable to find node '%.*s' for preloading in directory %lli\n", pl->pel->len, pl->pel->path, pl->dt);
+				tup_db_print(tf->f, pl->dt);
+				return -1;
+			}
+		}
+		if(tent->type != TUP_NODE_DIR) {
+			fprintf(tf->f, "tup error: preload needs to specify a pathname, but node '%.*s' has type '%s'\n", pl->pel->len, pl->pel->path, tup_db_type(tent->type));
+			return -1;
+		}
+		pl->dt = tent->tnode.tupid;
+	}
+	if(parse_dependent_tupfiles(&plist, tf) < 0)
+		return -1;
+
+	TAILQ_FOREACH(pl, &plist, list) {
+		if(gen_dir_list(tf, pl->dt) < 0)
+			return -1;
+	}
+	free_path_list(&plist);
+	free(eval_cmdline);
+	return 0;
 }
 
 static int run_script(struct tupfile *tf, char *cmdline, int lno,
@@ -725,7 +875,7 @@ static int run_script(struct tupfile *tf, char *cmdline, int lno,
 	}
 
 	pthread_mutex_lock(&tf->ps->lock);
-	rc = gen_dir_list(tf);
+	rc = gen_dir_list(tf, tf->tupid);
 	pthread_mutex_unlock(&tf->ps->lock);
 	if(rc < 0)
 		return -1;
@@ -740,7 +890,7 @@ static int run_script(struct tupfile *tf, char *cmdline, int lno,
 		if(tupid_tree_add_dup(&tf->input_root, tt->tupid) < 0)
 			return -1;
 	}
-	rc = server_run_script(tf->tupid, eval_cmdline, &tf->env_root, &rules);
+	rc = server_run_script(tf->f, tf->tupid, eval_cmdline, &tf->env_root, &rules);
 	free(eval_cmdline);
 	if(rc < 0)
 		return -1;
@@ -769,10 +919,6 @@ static int run_script(struct tupfile *tf, char *cmdline, int lno,
 	}
 
 	free(rules);
-	pthread_mutex_lock(&tf->ps->lock);
-	free_dir_list(tf->ps);
-	pthread_mutex_unlock(&tf->ps->lock);
-
 	return 0;
 
 out_err:
@@ -813,6 +959,10 @@ static int gitignore(struct tupfile *tf)
 		if(tup_db_select_tent(tf->tupid, ".gitignore", &tent) < 0)
 			return -1;
 		if(!tent) {
+			if(tf->refactoring) {
+				fprintf(tf->f, "tup refactoring error: Attempting to create a new .gitignore file.\n");
+				return -1;
+			}
 			if(tup_db_node_insert_tent(tf->tupid, ".gitignore", -1, TUP_NODE_GENERATED, -1, -1, &tent) < 0)
 				return -1;
 		} else {
@@ -826,6 +976,17 @@ static int gitignore(struct tupfile *tf)
 				if(tup_db_set_type(tent, TUP_NODE_GENERATED) < 0)
 					return -1;
 			}
+		}
+		if(tf->refactoring) {
+			/* If we're refactoring, we don't actually need to
+			 * write out the .gitignore file, since for the
+			 * refactoring to succeed, the contents of .gitignore
+			 * must be unchanged. Additionally, changing the
+			 * .gitignore file would cause its mtime to change,
+			 * resulting in a change detected in tup_db_changes()
+			 * (t4096).
+			 */
+			goto out_free;
 		}
 
 		fd = openat(tf->cur_dfd, ".gitignore", O_CREAT|O_WRONLY|O_TRUNC, 0666);
@@ -855,6 +1016,8 @@ static int gitignore(struct tupfile *tf)
 			return -1;
 		}
 	}
+
+out_free:
 	if(s) {
 		free(s); /* Freeze gopher! */
 	}
@@ -906,7 +1069,7 @@ static int include_file(struct tupfile *tf, const char *file)
 	}
 	newdt = find_dir_tupid_dt_pg(tf->f, tf->curtent->tnode.tupid, &pg, &pel, 0, 0);
 	if(newdt <= 0) {
-		fprintf(tf->f, "tup error: Unable to find directory for include file relative to '");
+		fprintf(tf->f, "tup error: Unable to find directory for include file '%s' relative to '", file);
 		print_tup_entry(tf->f, tf->curtent);
 		fprintf(tf->f, "'\n");
 		goto out_del_pg;
@@ -995,6 +1158,12 @@ static int parse_rule(struct tupfile *tf, char *p, int lno, struct bin_head *bl)
 			input += 7;
 			while(*input == ' ') input++;
 		}
+	}
+
+	/* Make sure we have an input string, and the input string doesn't
+	 * just contain order-only inputs.
+	 */
+	if(input && input[0] != '|') {
 		r.empty_input = 0;
 	} else {
 		r.empty_input = 1;
@@ -1399,6 +1568,12 @@ static int set_variable(struct tupfile *tf, char *line)
 				return -1;
 			}
 		}
+
+		if(tent->type != TUP_NODE_FILE && tent->type != TUP_NODE_DIR) {
+			fprintf(tf->f, "tup error: Node-variables can only refer to normal files and directories, not a '%s'.\n", tup_db_type(tent->type));
+			return -1;
+		}
+
 		/* var+1 to skip the leading '&' */
 		if(append)
 			rc = nodedb_append(&tf->node_db, var+1, tent);
@@ -1428,7 +1603,7 @@ static int parse_bang_rule_internal(struct tupfile *tf, struct rule *r,
 
 	/* Add any order only inputs to the list */
 	if(nl && br->input) {
-		tinput = tup_printf(tf, br->input, -1, nl, NULL, NULL, 0, 0);
+		tinput = tup_printf(tf, br->input, -1, nl, NULL, NULL, 0);
 		if(!tinput)
 			return -1;
 	} else {
@@ -1742,7 +1917,7 @@ static int execute_rule(struct tupfile *tf, struct rule *r, struct bin_head *bl)
 
 				banglist = &sc->banglist;
 
-				tinput = tup_printf(tf, sc->input_pattern, -1, r->output_nl, NULL, NULL, 0, 0);
+				tinput = tup_printf(tf, sc->input_pattern, -1, r->output_nl, NULL, NULL, 0);
 				if(!tinput)
 					return -1;
 				input_pattern = eval(tf, tinput, DISALLOW_NODES);
@@ -1996,7 +2171,7 @@ static int execute_reverse_rule(struct tupfile *tf, struct rule *r,
 		set_nle_base(&tmp_nle);
 		add_name_list_entry(&tmp_nl, &tmp_nle);
 
-		tinput = tup_printf(tf, r->output_pattern, -1, &tmp_nl, NULL, NULL, 0, 0);
+		tinput = tup_printf(tf, r->output_pattern, -1, &tmp_nl, NULL, NULL, 0);
 		if(!tinput)
 			return -1;
 		input_pattern = eval(tf, tinput, DISALLOW_NODES);
@@ -2090,18 +2265,15 @@ static int input_pattern_to_nl(struct tupfile *tf, char *p,
 			       int required)
 {
 	struct path_list_head plist;
-	struct path_list *pl, *tmp;
 
 	TAILQ_INIT(&plist);
 	if(get_path_list(tf, p, &plist, tf->tupid, bl) < 0)
 		return -1;
-	if(parse_dependent_tupfiles(&plist, tf, tf->g) < 0)
+	if(parse_dependent_tupfiles(&plist, tf) < 0)
 		return -1;
 	if(get_name_list(tf, &plist, nl, required) < 0)
 		return -1;
-	TAILQ_FOREACH_SAFE(pl, &plist, list, tmp) {
-		del_pl(pl, &plist);
-	}
+	free_path_list(&plist);
 	return 0;
 }
 
@@ -2127,6 +2299,7 @@ static int get_path_list(struct tupfile *tf, char *p, struct path_list_head *pli
 		}
 		pl->path = NULL;
 		pl->pel = NULL;
+		pl->group = 0;
 		pl->dt = 0;
 		pl->bin = NULL;
 
@@ -2154,7 +2327,7 @@ static int get_path_list(struct tupfile *tf, char *p, struct path_list_head *pli
 			/* Path */
 			struct pel_group pg;
 
-			if(p[0] == '<') {
+			if(strchr(p, '<') != NULL) {
 				/* Group */
 				char *endb;
 				endb = strchr(p, '>');
@@ -2162,6 +2335,7 @@ static int get_path_list(struct tupfile *tf, char *p, struct path_list_head *pli
 					fprintf(tf->f, "tup error: Expecting end angle bracket '>' character for group.\n");
 					return -1;
 				}
+				pl->group = 1;
 			}
 			pl->path = p;
 
@@ -2174,6 +2348,14 @@ static int get_path_list(struct tupfile *tf, char *p, struct path_list_head *pli
 			pl->dt = find_dir_tupid_dt_pg(tf->f, dt, &pg, &pl->pel, 0, 0);
 			if(pl->dt <= 0) {
 				fprintf(tf->f, "tup error: Failed to find directory ID for dir '%s' relative to %lli\n", p, dt);
+				return -1;
+			}
+			if(!pl->pel) {
+				if(strcmp(pl->path, ".") == 0) {
+					fprintf(tf->f, "tup error: Not expecting '.' path here.\n");
+					return -1;
+				}
+				fprintf(tf->f, "tup internal error: Final pel missing for path: '%s'\n", pl->path);
 				return -1;
 			}
 			if(pl->path == pl->pel->path) {
@@ -2217,6 +2399,15 @@ static void make_path_list_unique(struct path_list_head *plist)
 	}
 }
 
+static void free_path_list(struct path_list_head *plist)
+{
+	struct path_list *pl, *tmp;
+
+	TAILQ_FOREACH_SAFE(pl, plist, list, tmp) {
+		del_pl(pl, plist);
+	}
+}
+
 static void del_pl(struct path_list *pl, struct path_list_head *head)
 {
 	TAILQ_REMOVE(head, pl, list);
@@ -2253,8 +2444,7 @@ static void make_name_list_unique(struct name_list *nl)
 	tup_entry_release_list();
 }
 
-static int parse_dependent_tupfiles(struct path_list_head *plist,
-				    struct tupfile *tf, struct graph *g)
+static int parse_dependent_tupfiles(struct path_list_head *plist, struct tupfile *tf)
 {
 	struct path_list *pl;
 
@@ -2262,15 +2452,15 @@ static int parse_dependent_tupfiles(struct path_list_head *plist,
 		/* Only care about non-bins, and directories that are not our
 		 * own.
 		 */
-		if(!pl->bin && pl->dt != tf->tupid) {
+		if(!pl->bin && pl->dt != tf->tupid && !pl->group) {
 			struct node *n;
 
-			n = find_node(g, pl->dt);
+			n = find_node(tf->g, pl->dt);
 			if(n != NULL && !n->already_used) {
 				int rc;
 				struct timespan ts;
 				n->already_used = 1;
-				rc = parse(n, g, &ts);
+				rc = parse(n, tf->g, &ts, tf->refactoring);
 				if(rc < 0) {
 					if(rc == CIRCULAR_DEPENDENCY_ERROR) {
 						fprintf(tf->f, "tup error: Unable to parse dependent Tupfile due to circular directory-level dependencies: ");
@@ -2343,7 +2533,6 @@ static int nl_add_path(struct tupfile *tf, struct path_list *pl,
 	args.nl = nl;
 	if(char_find(pl->pel->path, pl->pel->len, "*?[") == 0) {
 		struct tup_entry *tent;
-		struct tup_entry *srctent = NULL;
 		struct variant *variant;
 
 		if(tup_db_select_tent_part(pl->dt, pl->pel->path, pl->pel->len, &tent) < 0) {
@@ -2357,6 +2546,8 @@ static int nl_add_path(struct tupfile *tf, struct path_list *pl,
 					return -1;
 				}
 			} else {
+				struct tup_entry *srctent = NULL;
+
 				if(variant_get_srctent(tf->variant, pl->dt, &srctent) < 0)
 					return -1;
 				if(srctent)
@@ -2385,12 +2576,35 @@ static int nl_add_path(struct tupfile *tf, struct path_list *pl,
 			return -1;
 		}
 		if(tupid_tree_search(&tf->g->gen_delete_root, tent->tnode.tupid) != NULL) {
+			struct tup_entry *srctent = NULL;
+			int valid_input = 0;
+
 			if(!required)
 				return 0;
+
+			/* If the file now exists in the srctree (ie: we
+			 * deleted the rule to create a generated file and
+			 * created a regular file in the srctree), then we are
+			 * good (t8072).
+			 */
+			if(variant_get_srctent(tf->variant, pl->dt, &srctent) < 0)
+				return -1;
+			if(srctent) {
+				struct tup_entry *tmp;
+				if(tup_db_select_tent_part(srctent->tnode.tupid, pl->pel->path, pl->pel->len, &tmp) < 0)
+					return -1;
+				if(tmp && tmp->type != TUP_NODE_GHOST) {
+					valid_input = 1;
+				}
+			}
+
 			/* If the file is in the modify list, it is going to be
 			 * resurrected, so it is still a valid input (t6053).
 			 */
-			if(!tup_db_in_modify_list(tent->tnode.tupid)) {
+			if(tup_db_in_modify_list(tent->tnode.tupid))
+				valid_input = 1;
+
+			if(!valid_input) {
 				fprintf(tf->f, "tup error: Explicitly named file '%.*s' in subdir '", pl->pel->len, pl->pel->path);
 				print_tupid(tf->f, pl->dt);
 				fprintf(tf->f, "' is scheduled to be deleted (possibly the command that created it has been removed).\n");
@@ -2410,12 +2624,12 @@ static int nl_add_path(struct tupfile *tf, struct path_list *pl,
 			return -1;
 		}
 
-		if(tup_db_select_node_dir_glob(build_name_list_cb, &args, pl->dt, pl->pel->path, pl->pel->len, &tf->g->gen_delete_root) < 0)
+		if(tup_db_select_node_dir_glob(build_name_list_cb, &args, pl->dt, pl->pel->path, pl->pel->len, &tf->g->gen_delete_root, 0) < 0)
 			return -1;
 		if(variant_get_srctent(tf->variant, pl->dt, &srctent) < 0)
 			return -1;
 		if(srctent) {
-			if(tup_db_select_node_dir_glob(build_name_list_cb, &args, srctent->tnode.tupid, pl->pel->path, pl->pel->len, &tf->g->gen_delete_root) < 0)
+			if(tup_db_select_node_dir_glob(build_name_list_cb, &args, srctent->tnode.tupid, pl->pel->path, pl->pel->len, &tf->g->gen_delete_root, 0) < 0)
 				return -1;
 		}
 	}
@@ -2551,6 +2765,35 @@ static int find_existing_command(const struct name_list *onl,
 	return 0;
 }
 
+static int add_input(struct tupfile *tf, struct tupid_entries *input_root,
+		     tupid_t tupid)
+{
+	struct tup_entry *tent;
+
+	if(tup_entry_add(tupid, &tent) < 0)
+		return -1;
+	if(tent->type == TUP_NODE_GENERATED) {
+		tupid_t cmdid;
+
+		if(tupid_tree_add_dup(input_root, tupid) < 0)
+			return -1;
+		if(tup_db_get_incoming_link(tupid, &cmdid) < 0)
+			return -1;
+		if(cmdid < 0) {
+			fprintf(tf->f, "tup error: Unable to find command id for output file: ");
+			print_tup_entry(tf->f, tent);
+			fprintf(tf->f, "\n");
+			return -1;
+		}
+		if(tup_db_get_inputs(cmdid, input_root, NULL) < 0)
+			return -1;
+	} else if(tent->type == TUP_NODE_VAR || tent->type == TUP_NODE_GROUP) {
+		if(tupid_tree_add_dup(input_root, tupid) < 0)
+			return -1;
+	}
+	return 0;
+}
+
 static int do_rule(struct tupfile *tf, struct rule *r, struct name_list *nl,
 		   const char *ext, int extlen, struct name_list *output_nl)
 {
@@ -2567,11 +2810,13 @@ static int do_rule(struct tupfile *tf, struct rule *r, struct name_list *nl,
 	struct tupid_tree *cmd_tt;
 	tupid_t cmdid = -1;
 	struct path_list_head oplist;
-	struct tupid_entries root = {NULL};
+	struct tupid_entries input_root = {NULL};
+	struct tupid_entries output_root = {NULL};
 	int extra_outputs = 0;
 	char sep[] = "|";
 	struct tup_entry *tmptent = NULL;
 	struct tup_entry *group = NULL;
+	struct tup_entry *old_group = NULL;
 
 	/* t3017 - empty rules are just pass-through to get the input into the
 	 * bin.
@@ -2590,7 +2835,7 @@ static int do_rule(struct tupfile *tf, struct rule *r, struct name_list *nl,
 	init_name_list(&extra_onl);
 	TAILQ_INIT(&oplist);
 
-	toutput = tup_printf(tf, r->output_pattern, -1, nl, NULL, ext, extlen, 1);
+	toutput = tup_printf(tf, r->output_pattern, -1, nl, NULL, ext, extlen);
 	if(!toutput)
 		return -1;
 	output_pattern = eval(tf, toutput, DISALLOW_NODES);
@@ -2648,7 +2893,7 @@ static int do_rule(struct tupfile *tf, struct rule *r, struct name_list *nl,
 		} else {
 			use_onl = NULL;
 		}
-		onle->path = tup_printf(tf, pl->pel->path, pl->pel->len, nl, use_onl, NULL, 0, 0);
+		onle->path = tup_printf(tf, pl->pel->path, pl->pel->len, nl, use_onl, NULL, 0);
 		if(!onle->path) {
 			free(onle);
 			return -1;
@@ -2712,7 +2957,7 @@ out_pl:
 	free(output_pattern);
 	free(extra_pattern);
 
-	tcmd = tup_printf(tf, r->command, -1, nl, &onl, ext, extlen, 1);
+	tcmd = tup_printf(tf, r->command, -1, nl, &onl, ext, extlen);
 	if(!tcmd)
 		return -1;
 	cmd = eval(tf, tcmd, ALLOW_NODES);
@@ -2738,8 +2983,21 @@ out_pl:
 		if(find_existing_command(&onl, &tf->g->cmd_delete_root, &cmdid) < 0)
 			return -1;
 		if(cmdid == -1) {
+			if(tf->refactoring) {
+				fprintf(tf->f, "tup refactoring error: Attempting to create a new command: %s\n", cmd);
+				return -1;
+			}
 			cmdid = create_command_file(tf->tupid, cmd);
 		} else {
+			if(tf->refactoring) {
+				struct tup_entry *old;
+				if(tup_entry_add(cmdid, &old) < 0)
+					return -1;
+				fprintf(tf->f, "tup refactoring error: Attempting to modify a command string:\n");
+				fprintf(tf->f, "Old: '%s'\n", old->name.s);
+				fprintf(tf->f, "New: '%s'\n", cmd);
+				return -1;
+			}
 			if(tup_db_set_name(cmdid, cmd) < 0)
 				return -1;
 		}
@@ -2761,10 +3019,13 @@ out_pl:
 		return -1;
 	}
 	tree_entry_remove(&tf->g->cmd_delete_root, cmdid, &tf->g->cmd_delete_count);
+	if(tf->refactoring) {
+		tree_entry_remove(&tf->refactoring_cmd_delete_root, cmdid, NULL);
+	}
 
 	while(!TAILQ_EMPTY(&onl.entries)) {
 		onle = TAILQ_FIRST(&onl.entries);
-		if(tup_db_create_unique_link(tf->f, cmdid, onle->tent->tnode.tupid, &tf->g->cmd_delete_root, &root) < 0) {
+		if(tup_db_create_unique_link(tf->f, cmdid, onle->tent->tnode.tupid, &tf->g->cmd_delete_root, &output_root) < 0) {
 			fprintf(tf->f, "tup error: You may have multiple commands trying to create file '%s'\n", onle->path);
 			return -1;
 		}
@@ -2775,7 +3036,7 @@ out_pl:
 
 	while(!TAILQ_EMPTY(&extra_onl.entries)) {
 		onle = TAILQ_FIRST(&extra_onl.entries);
-		if(tup_db_create_unique_link(tf->f, cmdid, onle->tent->tnode.tupid, &tf->g->cmd_delete_root, &root) < 0) {
+		if(tup_db_create_unique_link(tf->f, cmdid, onle->tent->tnode.tupid, &tf->g->cmd_delete_root, &output_root) < 0) {
 			fprintf(tf->f, "tup error: You may have multiple commands trying to create file '%s'\n", onle->path);
 			return -1;
 		}
@@ -2784,29 +3045,42 @@ out_pl:
 		delete_name_list_entry(&extra_onl, onle);
 	}
 
-	if(tup_db_write_outputs(cmdid, &root, group) < 0)
+	if(tup_db_write_outputs(tf->f, cmdid, &output_root, group, &old_group, tf->refactoring) < 0)
 		return -1;
-	free_tupid_tree(&root);
+	free_tupid_tree(&output_root);
 
 	TAILQ_FOREACH(nle, &nl->entries, list) {
-		if(tupid_tree_add_dup(&root, nle->tent->tnode.tupid) < 0)
+		if(add_input(tf, &input_root, nle->tent->tnode.tupid) < 0)
 			return -1;
 	}
 	TAILQ_FOREACH(nle, &r->order_only_inputs.entries, list) {
-		if(tupid_tree_add_dup(&root, nle->tent->tnode.tupid) < 0)
+		if(add_input(tf, &input_root, nle->tent->tnode.tupid) < 0)
 			return -1;
 	}
 	TAILQ_FOREACH(nle, &r->bang_oo_inputs.entries, list) {
-		if(tupid_tree_add_dup(&root, nle->tent->tnode.tupid) < 0)
+		if(add_input(tf, &input_root, nle->tent->tnode.tupid) < 0)
 			return -1;
 	}
 	RB_FOREACH(tt, tupid_entries, &tf->env_root) {
-		if(tupid_tree_add_dup(&root, tt->tupid) < 0)
+		if(add_input(tf, &input_root, tt->tupid) < 0)
 			return -1;
 	}
-	if(tup_db_write_inputs(cmdid, &root, &tf->env_root, &tf->g->gen_delete_root) < 0)
+	if(group) {
+		/* This is a quick check for a simple circular dependency that
+		 * can be done before the full check after all parsing is
+		 * complete.
+		 */
+		if(tupid_tree_search(&input_root, group->tnode.tupid) != NULL) {
+			fprintf(tf->f, "tup error: Command ID %lli both reads from and writes to this group: ", cmdid);
+			print_tup_entry(tf->f, group);
+			fprintf(tf->f, "\n");
+			tup_db_print(tf->f, cmdid);
+			return -1;
+		}
+	}
+	if(tup_db_write_inputs(tf->f, cmdid, &input_root, &tf->env_root, &tf->g->gen_delete_root, group, old_group, tf->refactoring) < 0)
 		return -1;
-	free_tupid_tree(&root);
+	free_tupid_tree(&input_root);
 	return 0;
 }
 
@@ -2909,7 +3183,7 @@ static const char *find_char(const char *s, int len, char c)
 
 static char *tup_printf(struct tupfile *tf, const char *cmd, int cmd_len,
 			struct name_list *nl, struct name_list *onl,
-			const char *ext, int extlen, int is_command)
+			const char *ext, int extlen)
 {
 	struct name_list_entry *nle;
 	char *s;
@@ -2971,8 +3245,8 @@ static char *tup_printf(struct tupfile *tf, const char *cmd, int cmd_len,
 			}
 			clen += extlen;
 		} else if(*next == 'o') {
-			if(!is_command) {
-				fprintf(tf->f, "tup error: %%o can only be used in a command.\n");
+			if(!onl) {
+				fprintf(tf->f, "tup error: %%o can only be used in a command string.\n");
 				return NULL;
 			}
 			if(onl->num_entries == 0) {
@@ -2990,6 +3264,29 @@ static char *tup_printf(struct tupfile *tf, const char *cmd, int cmd_len,
 				return NULL;
 			}
 			clen += onl->extlessbasetotlen;
+		} else if(*next == 'd') {
+			if(tf->tupid == DOT_DT) {
+				/* At the top of the tup-hierarchy, we get the
+				 * directory from where .tup is stored, since
+				 * the top-level tup entry is just "."
+				 */
+				char *last_slash;
+				const char *dirstring;
+
+				last_slash = strrchr(get_tup_top(), PATH_SEP);
+				if(last_slash) {
+					/* Point to the directory after the last slash */
+					dirstring = last_slash + 1;
+				} else {
+					dirstring = get_tup_top();
+				}
+				clen += strlen(dirstring);
+			} else {
+				/* Anywhere else in the hierarchy can just use
+				 * the last tup entry as the %d replacement.
+				 */
+				clen += tf->curtent->name.len;
+			}
 		} else if(*next == '%') {
 			clen++;
 		} else {
@@ -3066,6 +3363,28 @@ static char *tup_printf(struct tupfile *tf, const char *cmd, int cmd_len,
 		} else if(*next == '%') {
 			s[x] = '%';
 			x++;
+		} else if(*next == 'd') {
+			if(tf->tupid == DOT_DT) {
+				char *last_slash;
+				const char *dirstring;
+				int len;
+
+				last_slash = strrchr(get_tup_top(), PATH_SEP);
+				if(last_slash) {
+					dirstring = last_slash + 1;
+				} else {
+					dirstring = get_tup_top();
+				}
+				len = strlen(dirstring);
+				memcpy(&s[x], dirstring, len);
+				x += len;
+			} else {
+				/* Anywhere else in the hierarchy can just use
+				 * the last tup entry as the %d replacement.
+				 */
+				memcpy(&s[x], tf->curtent->name.s, tf->curtent->name.len);
+				x += tf->curtent->name.len;
+			}
 		} else {
 			fprintf(tf->f, "tup internal error: Unhandled %%-flag '%c'\n", *next);
 			return NULL;

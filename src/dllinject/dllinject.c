@@ -3,7 +3,7 @@
  * tup - A file-based build system
  *
  * Copyright (C) 2010  James McKaskill
- * Copyright (C) 2010-2012  Mike Shal <marfey@gmail.com>
+ * Copyright (C) 2010-2013  Mike Shal <marfey@gmail.com>
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 2 as
@@ -29,6 +29,9 @@
 
 #include <windows.h>
 #include <ntdef.h>
+#ifndef STATUS_SUCCESS
+#include <ntstatus.h>
+#endif
 #include <psapi.h>
 #include <stdio.h>
 #include <string.h>
@@ -395,6 +398,10 @@ static fopen_t				fopen_orig;
 static rename_t				rename_orig;
 static remove_t				remove_orig;
 
+#define TUP_CREATE_WRITE_FLAGS (GENERIC_WRITE | FILE_APPEND_DATA | FILE_WRITE_DATA | FILE_WRITE_ATTRIBUTES)
+/* Including ddk/wdm.h causes other issues, and this is all we need... */
+#define FILE_OPEN_FOR_BACKUP_INTENT 0x00004000
+
 #define handle_file(a, b, c) mhandle_file(a, b, c, __LINE__)
 static void mhandle_file(const char* file, const char* file2, enum access_type at, int line);
 static void handle_file_w(const wchar_t* file, const wchar_t* file2, enum access_type at);
@@ -403,7 +410,9 @@ static const char *strcasestr(const char *arg1, const char *arg2);
 static const wchar_t *wcscasestr(const wchar_t *arg1, const wchar_t *arg2);
 
 static char s_depfilename[PATH_MAX];
+static char s_vardict_file[PATH_MAX];
 static HANDLE deph = INVALID_HANDLE_VALUE;
+static HANDLE vardicth = INVALID_HANDLE_VALUE;
 
 static int writef(const char *data, unsigned int len)
 {
@@ -471,7 +480,7 @@ static HANDLE WINAPI CreateFileA_hook(
 		dwCreationDisposition,
 		dwFlagsAndAttributes);
 
-	if (h != INVALID_HANDLE_VALUE && dwDesiredAccess & GENERIC_WRITE) {
+	if (h != INVALID_HANDLE_VALUE && dwDesiredAccess & TUP_CREATE_WRITE_FLAGS) {
 		handle_file(lpFileName, NULL, ACCESS_WRITE);
 	} else {
 		handle_file(lpFileName, NULL, ACCESS_READ);
@@ -501,7 +510,7 @@ static HANDLE WINAPI CreateFileW_hook(
 		dwFlagsAndAttributes,
 		hTemplateFile);
 
-	if (h != INVALID_HANDLE_VALUE && dwDesiredAccess & GENERIC_WRITE) {
+	if (h != INVALID_HANDLE_VALUE && dwDesiredAccess & TUP_CREATE_WRITE_FLAGS) {
 		handle_file_w(lpFileName, NULL, ACCESS_WRITE);
 	} else {
 		handle_file_w(lpFileName, NULL, ACCESS_READ);
@@ -536,7 +545,7 @@ HANDLE WINAPI CreateFileTransactedA_hook(
 		pusMiniVersion,
 		lpExtendedParameter);
 
-	if (h != INVALID_HANDLE_VALUE && dwDesiredAccess & GENERIC_WRITE) {
+	if (h != INVALID_HANDLE_VALUE && dwDesiredAccess & TUP_CREATE_WRITE_FLAGS) {
 		handle_file(lpFileName, NULL, ACCESS_WRITE);
 	} else {
 		handle_file(lpFileName, NULL, ACCESS_READ);
@@ -569,7 +578,7 @@ HANDLE WINAPI CreateFileTransactedW_hook(
 		pusMiniVersion,
 		lpExtendedParameter);
 
-	if (h != INVALID_HANDLE_VALUE && dwDesiredAccess & GENERIC_WRITE) {
+	if (h != INVALID_HANDLE_VALUE && dwDesiredAccess & TUP_CREATE_WRITE_FLAGS) {
 		handle_file_w(lpFileName, NULL, ACCESS_WRITE);
 	} else {
 		handle_file_w(lpFileName, NULL, ACCESS_READ);
@@ -635,7 +644,7 @@ NTSTATUS WINAPI NtCreateFile_hook(
 				goto out_free;
 		}
 
-		if (rc == STATUS_SUCCESS && DesiredAccess & GENERIC_WRITE) {
+		if (rc == STATUS_SUCCESS && DesiredAccess & TUP_CREATE_WRITE_FLAGS) {
 			handle_file(name, NULL, ACCESS_WRITE);
 		} else {
 			handle_file(name, NULL, ACCESS_READ);
@@ -699,7 +708,7 @@ NTSTATUS WINAPI NtOpenFile_hook(
 			 * so that should be safe to ignore.
 			 */
 		} else {
-			if (rc == STATUS_SUCCESS && DesiredAccess & GENERIC_WRITE) {
+			if (rc == STATUS_SUCCESS && DesiredAccess & TUP_CREATE_WRITE_FLAGS) {
 				handle_file(name, NULL, ACCESS_WRITE);
 			} else {
 				handle_file(name, NULL, ACCESS_READ);
@@ -1113,8 +1122,8 @@ BOOL WINAPI CreateProcessA_hook(
 	}
 
 	/* Ignore mspdbsrv.exe, since it continues to run in the background */
-	if(strcasestr(lpApplicationName, "mspdbsrv.exe") == NULL)
-		tup_inject_dll(lpProcessInformation, s_depfilename);
+	if(!lpApplicationName || strcasestr(lpApplicationName, "mspdbsrv.exe") == NULL)
+		tup_inject_dll(lpProcessInformation, s_depfilename, s_vardict_file);
 
 	if ((dwCreationFlags & CREATE_SUSPENDED) != 0)
 		return 1;
@@ -1157,8 +1166,8 @@ BOOL WINAPI CreateProcessW_hook(
 	}
 
 	/* Ignore mspdbsrv.exe, since it continues to run in the background */
-	if(wcscasestr(lpApplicationName, L"mspdbsrv.exe") == NULL)
-		tup_inject_dll(lpProcessInformation, s_depfilename);
+	if(!lpApplicationName || wcscasestr(lpApplicationName, L"mspdbsrv.exe") == NULL)
+		tup_inject_dll(lpProcessInformation, s_depfilename, s_vardict_file);
 
 	if ((dwCreationFlags & CREATE_SUSPENDED) != 0)
 		return 1;
@@ -1202,8 +1211,8 @@ BOOL WINAPI CreateProcessAsUserA_hook(
 	}
 
 	/* Ignore mspdbsrv.exe, since it continues to run in the background */
-	if(strcasestr(lpApplicationName, "mspdbsrv.exe") == NULL)
-		tup_inject_dll(lpProcessInformation, s_depfilename);
+	if(!lpApplicationName || strcasestr(lpApplicationName, "mspdbsrv.exe") == NULL)
+		tup_inject_dll(lpProcessInformation, s_depfilename, s_vardict_file);
 
 	if ((dwCreationFlags & CREATE_SUSPENDED) != 0)
 		return 1;
@@ -1247,8 +1256,8 @@ BOOL WINAPI CreateProcessAsUserW_hook(
 	}
 
 	/* Ignore mspdbsrv.exe, since it continues to run in the background */
-	if(wcscasestr(lpApplicationName, L"mspdbsrv.exe") == NULL)
-		tup_inject_dll(lpProcessInformation, s_depfilename);
+	if(!lpApplicationName || wcscasestr(lpApplicationName, L"mspdbsrv.exe") == NULL)
+		tup_inject_dll(lpProcessInformation, s_depfilename, s_vardict_file);
 
 	if ((dwCreationFlags & CREATE_SUSPENDED) != 0)
 		return 1;
@@ -1292,8 +1301,8 @@ BOOL WINAPI CreateProcessWithLogonW_hook(
 	}
 
 	/* Ignore mspdbsrv.exe, since it continues to run in the background */
-	if(wcscasestr(lpApplicationName, L"mspdbsrv.exe") == NULL)
-		tup_inject_dll(lpProcessInformation, s_depfilename);
+	if(!lpApplicationName || wcscasestr(lpApplicationName, L"mspdbsrv.exe") == NULL)
+		tup_inject_dll(lpProcessInformation, s_depfilename, s_vardict_file);
 
 	if ((dwCreationFlags & CREATE_SUSPENDED) != 0)
 		return 1;
@@ -1333,8 +1342,8 @@ BOOL WINAPI CreateProcessWithTokenW_hook(
 	}
 
 	/* Ignore mspdbsrv.exe, since it continues to run in the background */
-	if(wcscasestr(lpApplicationName, L"mspdbsrv.exe") == NULL)
-		tup_inject_dll(lpProcessInformation, s_depfilename);
+	if(!lpApplicationName || wcscasestr(lpApplicationName, L"mspdbsrv.exe") == NULL)
+		tup_inject_dll(lpProcessInformation, s_depfilename, s_vardict_file);
 
 	if ((dwCreationFlags & CREATE_SUSPENDED) != 0)
 		return 1;
@@ -1386,6 +1395,7 @@ struct remote_thread_t
 	LoadLibraryA_t load_library;
 	GetProcAddress_t get_proc_address;
 	char depfilename[MAX_PATH];
+	char vardict_file[MAX_PATH];
 	char execdir[MAX_PATH];
 	char dll_name[MAX_PATH];
 	char func_name[256];
@@ -1598,17 +1608,28 @@ static void mhandle_file(const char* file, const char* file2, enum access_type a
 	if (ignore_file(file) || ignore_file(file2) || deph == INVALID_HANDLE_VALUE)
 		goto exit;
 
-	e->at = at;
+	if(strncmp(file, "@tup@", 5) == 0) {
+		const char *var = file+6;
+		e->at = ACCESS_VAR;
+		e->len = strlen(var);
+		e->len2 = 0;
+		strcpy(dest, var);
+		dest += e->len;
+		*(dest++) = '\0';
+		*(dest++) = '\0';
+	} else {
+		e->at = at;
 
-	e->len = canon_path(file, dest);
-	DEBUG_HOOK("Canonicalize1 [%i]: '%s' -> '%s', len=%i\n", line, file, dest, e->len);
-	dest += e->len;
-	*(dest++) = '\0';
+		e->len = canon_path(file, dest);
+		DEBUG_HOOK("Canonicalize1 [%i]: '%s' -> '%s', len=%i\n", line, file, dest, e->len);
+		dest += e->len;
+		*(dest++) = '\0';
 
-	e->len2 = canon_path(file2, dest);
-	DEBUG_HOOK("Canonicalize2: '%s' -> '%s' len2=%i\n", file2, file2 ? dest : NULL, e->len2);
-	dest += e->len2;
-	*(dest++) = '\0';
+		e->len2 = canon_path(file2, dest);
+		DEBUG_HOOK("Canonicalize2: '%s' -> '%s' len2=%i\n", file2, file2 ? dest : NULL, e->len2);
+		dest += e->len2;
+		*(dest++) = '\0';
+	}
 
 	DEBUG_HOOK("%s: '%s' '%s'\n", access_type_name[at], file, file2);
 	ret = writef((char*) e, dest - (char*) e);
@@ -1626,15 +1647,27 @@ static void handle_file_w(const wchar_t* file, const wchar_t* file2, enum access
 	char buf[ACCESS_EVENT_MAX_SIZE];
 	char afile[PATH_MAX];
 	char afile2[PATH_MAX];
-	size_t fsz = file ? wcslen(file) : 0;
-	size_t f2sz = file2 ? wcslen(file2) : 0;
+	size_t fsz;
+	size_t f2sz;
 	struct access_event* e = (struct access_event*) buf;
 	char* dest = (char*) (e + 1);
 	int ret;
 	int count;
+	wchar_t backslash_prefix[] = L"\\\\?\\"; /* \\?\ can be used as a prefix in wide-char paths */
+	const int backslash_prefix_len = 4;
 
 	if (ignore_file_w(file) || ignore_file_w(file2) || deph == INVALID_HANDLE_VALUE)
 		goto exit;
+
+	if(file)
+		if(wcsncmp(file, backslash_prefix, backslash_prefix_len) == 0)
+			file += backslash_prefix_len;
+	if(file2)
+		if(wcsncmp(file2, backslash_prefix, backslash_prefix_len) == 0)
+			file2 += backslash_prefix_len;
+
+	fsz = file ? wcslen(file) : 0;
+	f2sz = file2 ? wcslen(file2) : 0;
 
 	e->at = at;
 
@@ -1662,10 +1695,23 @@ exit:
 
 static int open_file(const char *depfilename)
 {
-	deph = CreateFile(depfilename, FILE_APPEND_DATA, FILE_SHARE_WRITE, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_TEMPORARY, NULL);
+	deph = CreateFile(depfilename, FILE_APPEND_DATA, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_TEMPORARY, NULL);
 	if(deph == INVALID_HANDLE_VALUE) {
-		perror(depfilename);
+		fprintf(stderr, "tup error: Unable to open dependency file '%s' in dllinject. Windows error code: 0x%08lx\n", depfilename, GetLastError());
 		return -1;
+	}
+	return 0;
+}
+
+static int open_vardict_file(const char *vardict_file)
+{
+	vardicth = CreateFile(vardict_file, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_TEMPORARY, NULL);
+	if(vardicth == INVALID_HANDLE_VALUE) {
+		/* Not an error if the file doesn't exist - we may not have a vardict. */
+		if(GetLastError() != ERROR_FILE_NOT_FOUND) {
+			fprintf(stderr, "tup error: Unable to open vardict file '%s' in dllinject. Windows error code: 0x%08lx\n", vardict_file, GetLastError());
+			return -1;
+		}
 	}
 	return 0;
 }
@@ -1687,15 +1733,12 @@ DWORD tup_inject_init(remote_thread_t* r)
 {
 	static int initialised = 0;
 	char filename[MAX_PATH];
+	char vardict_env[64];
+	int vardict_fd = -1;
+	OSVERSIONINFO osinfo;
 
 	if (initialised)
 		return 0;
-
-	/* Put TUP_VARDICT_NAME in the environment so if tup is running as the
-	 * sub-process it knows that certain commands are unavailable. Note
-	 * this isn't actually a valid file id, so varsed and all will fail.
-	 */
-	putenv(TUP_VARDICT_NAME "=-1");
 
 	initialised = 1;
 
@@ -1716,12 +1759,38 @@ DWORD tup_inject_init(remote_thread_t* r)
 
 	if (open_file(r->depfilename))
 		return 1;
+	if (open_vardict_file(r->vardict_file))
+		return 1;
+
+	if(vardicth != INVALID_HANDLE_VALUE) {
+		vardict_fd = _open_osfhandle((intptr_t)vardicth, 0);
+	}
+	snprintf(vardict_env, sizeof(vardict_env), TUP_VARDICT_NAME "=%i", vardict_fd);
+	vardict_env[sizeof(vardict_env)-1] = 0;
+	putenv(vardict_env);
 
 	strcpy(s_depfilename, r->depfilename);
+	strcpy(s_vardict_file, r->vardict_file);
 
 	handle_file(filename, NULL, ACCESS_READ);
 
-	hot_patch( patch_table, patch_table + patch_table_len );
+	/* What a horrible API... */
+	osinfo.dwOSVersionInfoSize = sizeof(osinfo);
+	GetVersionEx(&osinfo);
+
+	if(osinfo.dwMajorVersion >= 6) {
+		/* Only hot patch for Windows Vista and above. Hot patching
+		 * here gets our hook for FindFirstFile, which iat patching
+		 * doesn't get for some reason. I also tried to just iat patch
+		 * NtQueryDirectoryFile(), but then that ends up crashing for
+		 * some reason.
+		 *
+		 * For XP, the FindFirstFile hook works with iat patching, but
+		 * hot patching breaks file removal for some reason, so for
+		 * example 'gcc -flto foo.o -o foo.exe' will fail.
+		 */
+		hot_patch( patch_table, patch_table + patch_table_len );
+	}
 	iat_patch( patch_table, patch_table + patch_table_len );
 
 	return 0;
@@ -1763,7 +1832,8 @@ static void remote_end(void)
 
 int tup_inject_dll(
 	LPPROCESS_INFORMATION lpProcessInformation,
-	const char *depfilename)
+	const char *depfilename,
+	const char *vardict_file)
 {
 	remote_thread_t remote;
 	char* remote_data;
@@ -1777,6 +1847,7 @@ int tup_inject_dll(
 	remote.load_library = (LoadLibraryA_t) GetProcAddress(kernel32, "LoadLibraryA");
 	remote.get_proc_address = (GetProcAddress_t) GetProcAddress(kernel32, "GetProcAddress");
 	strcpy(remote.depfilename, depfilename);
+	strcpy(remote.vardict_file, vardict_file);
 	strcat(remote.execdir, execdir);
 	strcat(remote.dll_name, execdir);
 	strcat(remote.dll_name, "\\");
@@ -1792,7 +1863,8 @@ int tup_inject_dll(
 		remote.execdir,
 		remote.dll_name,
 		remote.func_name,
-		remote.depfilename);
+		remote.depfilename,
+		remote.vardict_file);
 
 	process = lpProcessInformation->hProcess;
 

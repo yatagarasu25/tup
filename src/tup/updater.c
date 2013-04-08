@@ -2,7 +2,7 @@
  *
  * tup - A file-based build system
  *
- * Copyright (C) 2008-2012  Mike Shal <marfey@gmail.com>
+ * Copyright (C) 2008-2013  Mike Shal <marfey@gmail.com>
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 2 as
@@ -58,8 +58,6 @@ static int process_update_nodes(int argc, char **argv, int *num_pruned);
 static int check_config_todo(void);
 static int check_create_todo(void);
 static int check_update_todo(int argc, char **argv);
-static int build_graph(struct graph *g);
-static int add_file_cb(void *arg, struct tup_entry *tent, int style);
 static int execute_graph(struct graph *g, int keep_going, int jobs,
 			 void *(*work_func)(void *));
 
@@ -73,6 +71,7 @@ static int num_jobs;
 static int full_deps;
 static int warnings;
 static int show_warnings;
+static int refactoring;
 
 static pthread_mutex_t db_mutex;
 static pthread_mutex_t display_mutex;
@@ -178,6 +177,11 @@ int updater(int argc, char **argv, int phase)
 	if(num_jobs > MAX_JOBS) {
 		fprintf(stderr, "Warning: Setting the number of jobs to MAX_JOBS\n");
 		num_jobs = MAX_JOBS;
+	}
+
+	if(phase < 0) {
+		phase = -phase;
+		refactoring = 1;
 	}
 
 	if(run_scan(do_scan) < 0)
@@ -555,6 +559,30 @@ static int is_valid_variant_tent(struct tup_entry *tent)
 	return 1;
 }
 
+static int recurse_delete_variant(struct tup_entry *tent)
+{
+	/* If we had a variant corresponding to this tup.config, then we need
+	 * to wipe out all of our @-variables, remove the varaint, remove our
+	 * tup.config node, and delete the variant tree. We also add the
+	 * variant directory to the create_list so it can be propagated to
+	 * other variants (if it still exists).
+	 */
+	struct tup_entry *parent = tent->parent;
+
+	if(delete_name_file(tent->tnode.tupid) < 0)
+		return -1;
+	if(tup_db_delete_variant(parent, NULL, NULL) < 0)
+		return -1;
+	if(parent->type == TUP_NODE_GHOST) {
+		if(delete_name_file(parent->tnode.tupid) < 0)
+			return -1;
+	} else {
+		if(tup_db_add_create_list(parent->tnode.tupid) < 0)
+			return -1;
+	}
+	return 0;
+}
+
 static int process_config_nodes(int environ_check)
 {
 	struct graph g;
@@ -571,7 +599,7 @@ static int process_config_nodes(int environ_check)
 	/* Use TUP_NODE_ROOT to count everything */
 	if(create_graph(&g, TUP_NODE_ROOT) < 0)
 		return -1;
-	if(tup_db_select_node_by_flags(add_file_cb, &g, TUP_FLAGS_CONFIG) < 0)
+	if(tup_db_select_node_by_flags(build_graph_cb, &g, TUP_FLAGS_CONFIG) < 0)
 		return -1;
 
 	/* Pop off the root node since we don't use it here. */
@@ -623,37 +651,35 @@ static int process_config_nodes(int environ_check)
 
 			if(!is_valid_variant_tent(n->tent) && n->tent->dt != DOT_DT) {
 				/* tup.config deleted */
-				struct tup_entry *parent = n->tent->parent;
 
 				/* Reset the build directory's variant link. We
 				 * may have set it in tup_file_missing().
 				 */
-				parent->variant = NULL;
+				n->tent->parent->variant = NULL;
 				if(variant) {
-					/* If we had a variant corresponding to
-					 * this tup.config, then we need to
-					 * wipe out all of our @-variables,
-					 * remove the varaint, remove our
-					 * tup.config node, and delete the
-					 * variant tree. We also add the
-					 * variant directory to the create_list
-					 * so it can be propagated to other
-					 * variants (if it still exists).
-					 */
-					show_result(n->tent, 0, NULL, "delete variant");
-					if(tup_db_delete_tup_config(n->tent) < 0)
-						return -1;
 					if(variant_rm(variant) < 0)
 						return -1;
-					if(delete_name_file(n->tent->tnode.tupid) < 0)
+					if(tup_db_delete_tup_config(n->tent) < 0)
 						return -1;
-					if(tup_db_delete_variant(parent, NULL, NULL) < 0)
-						return -1;
-					if(parent->type == TUP_NODE_GHOST) {
-						if(delete_name_file(parent->tnode.tupid) < 0)
+
+					if(n->tent->parent->dt == DOT_DT) {
+						show_result(n->tent, 0, NULL, "delete variant");
+						if(recurse_delete_variant(n->tent) < 0)
 							return -1;
 					} else {
-						if(tup_db_add_create_list(parent->tnode.tupid) < 0)
+						/* The variant directory was
+						 * moved to the source tree,
+						 * and the monitor saw it.
+						 * We've already deleted the
+						 * variant and @-variables, so
+						 * just unset the config flag,
+						 * and all the generated nodes
+						 * will become normal nodes
+						 * during the regular
+						 * generated -> normal code.
+						 */
+						show_result(n->tent, 0, NULL, "discard variant");
+						if(tup_db_unflag_config(n->tent->tnode.tupid) < 0)
 							return -1;
 					}
 					variants_removed = 1;
@@ -866,17 +892,31 @@ static int rm_variant_dir_cb(void *arg, struct tup_entry *tent)
 	return 0;
 }
 
+static int mark_variant_dir_for_deletion(struct graph *g, struct node *n)
+{
+	if(tup_db_select_node_by_link(build_graph_cb, g, n->tent->tnode.tupid) < 0)
+		return -1;
+	TAILQ_REMOVE(&g->plist, n, list);
+	TAILQ_INSERT_TAIL(&g->removing_list, n, list);
+	n->state = STATE_REMOVING;
+	return 0;
+}
+
 static int process_create_nodes(void)
 {
 	struct graph g;
 	struct node *n;
 	struct node *tmp;
 	int rc;
+	int old_changes = 0;
+
+	if(refactoring)
+		old_changes = tup_db_changes();
 
 	tup_db_begin();
 	if(create_graph(&g, TUP_NODE_DIR) < 0)
 		return -1;
-	if(tup_db_select_node_by_flags(add_file_cb, &g, TUP_FLAGS_CREATE) < 0)
+	if(tup_db_select_node_by_flags(build_graph_cb, &g, TUP_FLAGS_CREATE) < 0)
 		return -1;
 	TAILQ_FOREACH_SAFE(n, &g.plist, list, tmp) {
 		struct variant *node_variant = tup_entry_variant(n->tent);
@@ -897,7 +937,7 @@ static int process_create_nodes(void)
 						fprintf(stderr, "\n");
 						return -1;
 					}
-					if(add_file_cb(&g, new_tent, TUP_LINK_NORMAL) < 0)
+					if(build_graph_cb(&g, new_tent) < 0)
 						return -1;
 				}
 			}
@@ -907,30 +947,37 @@ static int process_create_nodes(void)
 		} else {
 			struct tup_entry *srctent;
 			int force_removal = 0;
-			if(tup_entry_add(n->tent->srcid, &srctent) < 0) {
-				return -1;
-			}
-			/* If the srctent is no longer a directory, that means
-			 * our reason for existing is gone. Force our removal.
-			 */
-			if(srctent->type != TUP_NODE_DIR)
-				force_removal = 1;
-			/* If we are a variant subdirectory (our srcid
-			 * is not DOT_DT), and our name doesn't match
-			 * our srcid, that means the srctree was
-			 * renamed, and we go away.
-			 */
-			if(n->tent->srcid != DOT_DT &&
-			   strcmp(srctent->name.s, n->tent->name.s) != 0) {
-				force_removal = 1;
-			}
 
-			if(force_removal) {
-				if(tup_db_select_node_by_link(add_file_cb, &g, n->tent->tnode.tupid) < 0)
+			if(n->tent->srcid == -1) {
+				/* Ignore directories that we manually created inside
+				 * the variant directory (eg: mkdir build/tmpdir)
+				 */
+			} else if(n->tent->srcid == VARIANT_SRCDIR_REMOVED) {
+				if(mark_variant_dir_for_deletion(&g, n) < 0)
 					return -1;
-				TAILQ_REMOVE(&g.plist, n, list);
-				TAILQ_INSERT_TAIL(&g.removing_list, n, list);
-				n->state = STATE_REMOVING;
+			} else {
+				if(tup_entry_add(n->tent->srcid, &srctent) < 0) {
+					return -1;
+				}
+				/* If the srctent is no longer a directory, that means
+				 * our reason for existing is gone. Force our removal.
+				 */
+				if(srctent->type != TUP_NODE_DIR)
+					force_removal = 1;
+				/* If we are a variant subdirectory (our srcid
+				 * is not DOT_DT), and our name doesn't match
+				 * our srcid, that means the srctree was
+				 * renamed, and we go away.
+				 */
+				if(n->tent->srcid != DOT_DT &&
+				   strcmp(srctent->name.s, n->tent->name.s) != 0) {
+					force_removal = 1;
+				}
+
+				if(force_removal) {
+					if(mark_variant_dir_for_deletion(&g, n) < 0)
+						return -1;
+				}
 			}
 		}
 	}
@@ -973,6 +1020,12 @@ static int process_create_nodes(void)
 			tup_main_progress("No files to delete.\n");
 		}
 		rc = delete_files(&g);
+		if(rc == 0 && group_need_circ_check()) {
+			/* TODO: Extra space */
+			tup_show_message("Checking circular dependencies among groups...\n");
+			if(group_circ_check() < 0)
+				rc = -1;
+		}
 	}
 	if(rc < 0) {
 		tup_db_rollback();
@@ -984,6 +1037,14 @@ static int process_create_nodes(void)
 out_destroy:
 	if(destroy_graph(&g) < 0)
 		return -1;
+
+	if(refactoring) {
+		if(tup_db_changes() != old_changes) {
+			fprintf(stderr, "tup error: The database changed while refactoring. Tup should have caught this change before here and reported it as an error. Please run 'tup refactor --debug-sql' and send the output to the tup-users@googlegroups.com mailing list.\n");
+			tup_db_rollback();
+			return -1;
+		}
+	}
 	tup_db_commit();
 	return 0;
 }
@@ -996,7 +1057,7 @@ static int process_update_nodes(int argc, char **argv, int *num_pruned)
 	tup_db_begin();
 	if(create_graph(&g, TUP_NODE_CMD) < 0)
 		return -1;
-	if(tup_db_select_node_by_flags(add_file_cb, &g, TUP_FLAGS_MODIFY) < 0)
+	if(tup_db_select_node_by_flags(build_graph_cb, &g, TUP_FLAGS_MODIFY) < 0)
 		return -1;
 	if(build_graph(&g) < 0)
 		return -1;
@@ -1055,7 +1116,7 @@ static int check_config_todo(void)
 	/* Use TUP_NODE_ROOT to count everything */
 	if(create_graph(&g, TUP_NODE_ROOT) < 0)
 		return -1;
-	if(tup_db_select_node_by_flags(add_file_cb, &g, TUP_FLAGS_CONFIG) < 0)
+	if(tup_db_select_node_by_flags(build_graph_cb, &g, TUP_FLAGS_CONFIG) < 0)
 		return -1;
 	if(build_graph(&g) < 0)
 		return -1;
@@ -1087,7 +1148,7 @@ static int check_create_todo(void)
 
 	if(create_graph(&g, TUP_NODE_DIR) < 0)
 		return -1;
-	if(tup_db_select_node_by_flags(add_file_cb, &g, TUP_FLAGS_CREATE) < 0)
+	if(tup_db_select_node_by_flags(build_graph_cb, &g, TUP_FLAGS_CREATE) < 0)
 		return -1;
 	if(build_graph(&g) < 0)
 		return -1;
@@ -1118,7 +1179,7 @@ static int check_update_todo(int argc, char **argv)
 
 	if(create_graph(&g, TUP_NODE_CMD) < 0)
 		return -1;
-	if(tup_db_select_node_by_flags(add_file_cb, &g, TUP_FLAGS_MODIFY) < 0)
+	if(tup_db_select_node_by_flags(build_graph_cb, &g, TUP_FLAGS_MODIFY) < 0)
 		return -1;
 	if(build_graph(&g) < 0)
 		return -1;
@@ -1143,81 +1204,6 @@ static int check_update_todo(int argc, char **argv)
 	if(destroy_graph(&g) < 0)
 		return -1;
 	return rc;
-}
-
-static int build_graph(struct graph *g)
-{
-	struct node *cur;
-
-	while(!TAILQ_EMPTY(&g->plist)) {
-		cur = TAILQ_FIRST(&g->plist);
-		if(cur->state == STATE_INITIALIZED) {
-			DEBUGP("find deps for node: %lli\n", cur->tnode.tupid);
-			g->cur = cur;
-			if(tup_db_select_node_by_link(add_file_cb, g, cur->tnode.tupid) < 0)
-				return -1;
-			cur->state = STATE_PROCESSING;
-		} else if(cur->state == STATE_PROCESSING) {
-			DEBUGP("remove node from stack: %lli\n", cur->tnode.tupid);
-			TAILQ_REMOVE(&g->plist, cur, list);
-			TAILQ_INSERT_TAIL(&g->node_list, cur, list);
-			cur->state = STATE_FINISHED;
-		} else if(cur->state == STATE_FINISHED) {
-			fprintf(stderr, "tup internal error: STATE_FINISHED node %lli in plist\n", cur->tnode.tupid);
-			tup_db_print(stderr, cur->tnode.tupid);
-			return -1;
-		}
-	}
-
-	return 0;
-}
-
-static int add_file_cb(void *arg, struct tup_entry *tent, int style)
-{
-	struct graph *g = arg;
-	struct node *n;
-	int expandable = 0;
-
-	n = find_node(g, tent->tnode.tupid);
-	if(n != NULL)
-		goto edge_create;
-	n = create_node(g, tent);
-	if(!n)
-		return -1;
-
-edge_create:
-	if(n->state == STATE_PROCESSING) {
-		/* A circular dependency is not guaranteed to trigger this,
-		 * but it is easy to check before going through the graph.
-		 */
-		fprintf(stderr, "tup error: Circular dependency detected! "
-			"Last edge was: %lli -> %lli\n",
-			g->cur->tnode.tupid, tent->tnode.tupid);
-		return -1;
-	}
-	if(style & TUP_LINK_NORMAL)
-		expandable = 1;
-	if(n->tent->type == TUP_NODE_GROUP)
-		expandable = 1;
-	if(expandable && n->expanded == 0) {
-		/* TUP_NODE_ROOT means we count everything */
-		if(n->tent->type == g->count_flags || g->count_flags == TUP_NODE_ROOT) {
-			g->num_nodes++;
-			if(g->total_mtime != -1) {
-				if(n->tent->mtime == -1)
-					g->total_mtime = -1;
-				else
-					g->total_mtime += n->tent->mtime;
-			}
-		}
-		n->expanded = 1;
-		TAILQ_REMOVE(&g->node_list, n, list);
-		TAILQ_INSERT_HEAD(&g->plist, n, list);
-	}
-
-	if(create_edge(g->cur, n, style) < 0)
-		return -1;
-	return 0;
 }
 
 static void pop_node(struct graph *g, struct node *n)
@@ -1395,7 +1381,7 @@ check_empties:
 			if(fchdir(tup_top_fd()) < 0) {
 				perror("fchdir");
 			}
-			dump_graph(g, ".tup/tmp/graph-%i.dot");
+			save_graphs(g);
 		}
 	} else {
 		rc = 0;
@@ -1464,25 +1450,43 @@ static void *create_work(void *arg)
 				if(n->already_used) {
 					rc = 0;
 				} else {
-					rc = parse(n, g, NULL);
+					rc = parse(n, g, NULL, refactoring);
 				}
 				show_progress(-1, TUP_NODE_DIR);
 			}
 		} else if(n->tent->type == TUP_NODE_VAR ||
 			  n->tent->type == TUP_NODE_FILE ||
 			  n->tent->type == TUP_NODE_GENERATED ||
+			  n->tent->type == TUP_NODE_GROUP ||
 			  n->tent->type == TUP_NODE_CMD) {
 			rc = 0;
 		} else {
 			fprintf(stderr, "tup error: Unknown node type %i with ID %lli named '%s' in create graph.\n", n->tent->type, n->tnode.tupid, n->tent->name.s);
 			rc = -1;
 		}
-		if(tup_db_unflag_create(n->tnode.tupid) < 0)
-			rc = -1;
+		if(!refactoring) {
+			if(tup_db_unflag_create(n->tnode.tupid) < 0)
+				rc = -1;
+		}
 
 		worker_ret(wt, rc);
 	}
 	return NULL;
+}
+
+static int modify_outputs(struct node *n)
+{
+	struct edge *e;
+	int rc = 0;
+
+	LIST_FOREACH(e, &n->edges, list) {
+		if(e->style & TUP_LINK_NORMAL &&
+		   e->dest->tent->type == TUP_NODE_CMD) {
+			if(tup_db_add_modify_list(e->dest->tnode.tupid) < 0)
+				rc = -1;
+		}
+	}
+	return rc;
 }
 
 static void *update_work(void *arg)
@@ -1523,14 +1527,9 @@ static void *update_work(void *arg)
 			if(rc == 0) {
 				pthread_mutex_lock(&db_mutex);
 				LIST_FOREACH(e, &n->edges, list) {
-					struct edge *f;
-
-					LIST_FOREACH(f, &e->dest->edges, list) {
-						if(f->style & TUP_LINK_NORMAL) {
-							if(tup_db_add_modify_list(f->dest->tnode.tupid) < 0)
-								rc = -1;
-						}
-					}
+					if(e->dest->tent->type == TUP_NODE_GENERATED)
+						if(modify_outputs(e->dest) < 0)
+							rc = -1;
 				}
 				if(tup_db_unflag_modify(n->tnode.tupid) < 0)
 					rc = -1;
@@ -1541,12 +1540,8 @@ static void *update_work(void *arg)
 			/* Mark the next nodes as modify in case we hit
 			 * an error - we'll need to pick up there (t6006).
 			 */
-			LIST_FOREACH(e, &n->edges, list) {
-				if(e->style & TUP_LINK_NORMAL) {
-					if(tup_db_add_modify_list(e->dest->tnode.tupid) < 0)
-						rc = -1;
-				}
-			}
+			if(modify_outputs(n) < 0)
+				rc = -1;
 			if(tup_db_unflag_modify(n->tnode.tupid) < 0)
 				rc = -1;
 
@@ -1661,6 +1656,9 @@ static int process_output(struct server *s, struct tup_entry *tent,
 		if(sig >= 0 && sig < ARRAY_SIZE(signal_err) && signal_err[sig])
 			errmsg = signal_err[sig];
 		fprintf(f, " *** Command ID=%lli killed by signal %i (%s)\n", tent->tnode.tupid, sig, errmsg);
+		if(write_files(f, tent->tnode.tupid, &s->finfo, warning_dest, 1, sticky_root, normal_root, full_deps, tup_entry_vardt(tent)) < 0) {
+			fprintf(f, " *** Additionally, command %lli failed to process input dependencies.", tent->tnode.tupid);
+		}
 	} else {
 		fprintf(f, "tup internal error: Expected s->exited or s->signalled to be set for command ID=%lli", tent->tnode.tupid);
 	}
@@ -1669,13 +1667,13 @@ static int process_output(struct server *s, struct tup_entry *tent,
 	rewind(f);
 
 	show_result(tent, is_err, show_ts, NULL);
-	if(display_output(s->output_fd, is_err ? 3 : 0, tent->name.s, 0) < 0)
+	if(display_output(s->output_fd, is_err ? 3 : 0, tent->name.s, 0, NULL) < 0)
 		return -1;
 	if(close(s->output_fd) < 0) {
 		perror("close(s->output_fd)");
 		return -1;
 	}
-	if(display_output(fileno(f), 2, tent->name.s, 0) < 0)
+	if(display_output(fileno(f), 2, tent->name.s, 0, NULL) < 0)
 		return -1;
 	if(fclose(f) != 0) {
 		perror("fclose");
@@ -1752,7 +1750,7 @@ static int update(struct node *n)
 		goto err_close_dfd;
 
 	pthread_mutex_lock(&db_mutex);
-	rc = tup_db_get_links(n->tent->tnode.tupid, &sticky_root, &normal_root);
+	rc = tup_db_get_inputs(n->tent->tnode.tupid, &sticky_root, &normal_root);
 	if(rc == 0)
 		rc = tup_db_get_environ(&sticky_root, &normal_root, &newenv);
 	initialize_server_struct(&s, n->tent);

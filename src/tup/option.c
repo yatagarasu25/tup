@@ -21,11 +21,8 @@
 #if defined(__APPLE__)
 #include <sys/sysctl.h>
 #elif defined(_WIN32)
-/* Don't let Windows define SLIST_ENTRY and conflict with bsd/queue.h */
-#define _SLIST_HEADER_
-
 /* _WIN32_IE needed for SHGetSpecialFolderPath() */
-#define _WIN32_IE 0x0400
+#define _WIN32_IE 0x0500
 #include <windows.h>
 #include <shlobj.h>
 #endif
@@ -93,7 +90,10 @@ static struct option {
 static int inited = 0;
 static volatile sig_atomic_t win_resize_requested = 0;
 
-#ifndef _WIN32
+#ifdef _WIN32
+static void reset_console(void);
+static CONSOLE_SCREEN_BUFFER_INFO csbi;
+#else
 static void win_resize_handler(int sig);
 static struct sigaction sigact = {
 	.sa_handler = win_resize_handler,
@@ -104,6 +104,11 @@ static struct sigaction sigact = {
 int tup_option_init(void)
 {
 	unsigned int x;
+
+#ifdef _WIN32
+	if(GetConsoleScreenBufferInfo(GetStdHandle(STD_OUTPUT_HANDLE), &csbi))
+		atexit(reset_console);
+#endif
 
 	for(x=0; x<NUM_OPTIONS; x++) {
 		if(options[x].generator)
@@ -119,6 +124,7 @@ int tup_option_init(void)
 		if(parse_option_file(x) < 0)
 			return -1;
 	}
+
 #ifndef _WIN32
 	sigemptyset(&sigact.sa_mask);
 	sigaction(SIGWINCH, &sigact, NULL);
@@ -322,9 +328,7 @@ static const char *get_console_width(void)
 	if(ioctl(STDOUT_FILENO, TIOCGWINSZ, &wsz) == 0)
 		width = wsz.ws_col;
 #elif defined(_WIN32)
-	CONSOLE_SCREEN_BUFFER_INFO csbi;
-	if(GetConsoleScreenBufferInfo(GetStdHandle(STD_OUTPUT_HANDLE), &csbi))
-		width = csbi.dwSize.X;
+	width = csbi.dwSize.X;
 #endif
 	snprintf(buf, sizeof(buf), "%d", width);
 	buf[sizeof(buf) - 1] = 0;
@@ -367,7 +371,13 @@ static int init_home_loc(void)
 #endif
 }
 
-#ifndef _WIN32
+
+#ifdef _WIN32
+static void reset_console(void)
+{
+        SetConsoleTextAttribute(GetStdHandle(STD_OUTPUT_HANDLE), csbi.wAttributes);
+}
+#else
 static void win_resize_handler(int sig)
 {
 	if(sig) {}

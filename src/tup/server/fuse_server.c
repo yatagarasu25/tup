@@ -2,7 +2,7 @@
  *
  * tup - A file-based build system
  *
- * Copyright (C) 2011-2012  Mike Shal <marfey@gmail.com>
+ * Copyright (C) 2011-2013  Mike Shal <marfey@gmail.com>
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 2 as
@@ -32,6 +32,7 @@
 #include "tup/progress.h"
 #include "tup/option.h"
 #include "tup/variant.h"
+#include "tup/container.h"
 #include "tup_fuse_fs.h"
 #include "master_fork.h"
 #include <stdio.h>
@@ -252,6 +253,10 @@ int server_init(enum server_mode mode)
 	}
 #ifdef __APPLE__
 	if(fuse_opt_add_arg(&args, "-onobrowse,noappledouble,noapplexattr,quiet") < 0)
+		return -1;
+#endif
+#ifdef __FreeBSD__
+	if(fuse_opt_add_arg(&args, "-ouse_ino") < 0)
 		return -1;
 #endif
 
@@ -498,7 +503,7 @@ int server_postexec(struct server *s)
 	return 0;
 }
 
-int server_run_script(tupid_t tupid, const char *cmdline,
+int server_run_script(FILE *f, tupid_t tupid, const char *cmdline,
 		      struct tupid_entries *env_root, char **rules)
 {
 	struct tup_entry *tent;
@@ -520,7 +525,7 @@ int server_run_script(tupid_t tupid, const char *cmdline,
 		return -1;
 	environ_free(&te);
 
-	if(display_output(s.error_fd, 1, cmdline, 1) < 0)
+	if(display_output(s.error_fd, 1, cmdline, 1, f) < 0)
 		return -1;
 	if(close(s.error_fd) < 0) {
 		perror("close(s.error_fd)");
@@ -539,12 +544,12 @@ int server_run_script(tupid_t tupid, const char *cmdline,
 			*rules = b.s;
 			return 0;
 		}
-		fprintf(stderr, "tup error: run-script exited with failure code: %i\n", s.exit_status);
+		fprintf(f, "tup error: run-script exited with failure code: %i\n", s.exit_status);
 	} else {
 		if(s.signalled) {
-			fprintf(stderr, "tup error: run-script terminated with signal %i\n", s.exit_sig);
+			fprintf(f, "tup error: run-script terminated with signal %i\n", s.exit_sig);
 		} else {
-			fprintf(stderr, "tup error: run-script terminated abnormally.\n");
+			fprintf(f, "tup error: run-script terminated abnormally.\n");
 		}
 	}
 	return -1;
@@ -604,6 +609,8 @@ int tup_fuse_server_get_dir_entries(const char *path, void *buf,
 				    fuse_fill_dir_t filler)
 {
 	struct parser_entry *pe;
+	struct parser_directory *pd;
+	struct string_tree *st;
 	int rc = -1;
 
 	pthread_mutex_lock(&curps_lock);
@@ -612,11 +619,15 @@ int tup_fuse_server_get_dir_entries(const char *path, void *buf,
 		goto out_err;
 	}
 	pthread_mutex_lock(&curps->lock);
-	if(strcmp(path, curps->path) != 0) {
-		fprintf(stderr, "tup error: Unable to readdir() on directory '%s'. Run-scripts are currently limited to readdir() only the current directory.\n", path);
+	st = string_tree_search(&curps->directories, path, strlen(path));
+	if(!st) {
+		/* path+1 to skip leading '/' */
+		fprintf(stderr, "tup error: Unable to readdir() on directory '%s'. Run-scripts are currently limited to readdir() only the current directory, and any preloaded directories. Try using the 'preload' keyword in the Tupfile to load the directory before running the run script.\n", path+1);
 		goto out_unps;
 	}
-	LIST_FOREACH(pe, &curps->file_list, list) {
+	pd = container_of(st, struct parser_directory, st);
+
+	LIST_FOREACH(pe, &pd->file_list, list) {
 		if(filler(buf, pe->name, NULL, 0))
 			goto out_unps;
 	}
